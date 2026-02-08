@@ -1,0 +1,4 @@
+{"input": "Query: 'async function fetchData'\nContext: Finding specific function", "expected": "Tool: Grep\nReason: Exact function signature - Grep matches literal string", "metadata": {"decision": "grep", "query_type": "exact_function"}}
+{"input": "Query: 'import { useState }'\nContext: Finding imports", "expected": "Tool: Grep\nReason: Exact import statement - Grep matches literal strings perfectly", "metadata": {"decision": "grep", "query_type": "exact_import"}}
+{"input": "Query: 'database connection pooling'\nContext: Understanding infrastructure", "expected": "Tool: mgrep\nReason: Conceptual search about infrastructure - mgrep finds related code by understanding meaning", "metadata": {"decision": "mgrep", "query_type": "semantic"}}
+{"input": "Query: 'class UserService'\nContext: Finding class definition", "expected": "Tool: Grep\nReason: Exact class name - Grep matches literal string instantly", "metadata": {"decision": "grep", "query_type": "exact_class"}}

@@ -1,0 +1,58 @@
+[
+  {
+    "dataset": "code-reviews",
+    "original_count": 15,
+    "holdout_count": 3,
+    "training_count": 12,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/code-reviews-holdout.jsonl"
+  },
+  {
+    "dataset": "test-suites",
+    "original_count": 10,
+    "holdout_count": 2,
+    "training_count": 8,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/test-suites-holdout.jsonl"
+  },
+  {
+    "dataset": "security-audits",
+    "original_count": 10,
+    "holdout_count": 2,
+    "training_count": 8,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/security-audits-holdout.jsonl"
+  },
+  {
+    "dataset": "performance-analysis",
+    "original_count": 10,
+    "holdout_count": 2,
+    "training_count": 8,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/performance-analysis-holdout.jsonl"
+  },
+  {
+    "dataset": "search-routing",
+    "original_count": 30,
+    "holdout_count": 6,
+    "training_count": 24,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/search-routing-holdout.jsonl"
+  },
+  {
+    "dataset": "search-decisions",
+    "original_count": 20,
+    "holdout_count": 4,
+    "training_count": 16,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/search-decisions-holdout.jsonl"
+  },
+  {
+    "dataset": "tool-selection",
+    "original_count": 25,
+    "holdout_count": 5,
+    "training_count": 20,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/tool-selection-holdout.jsonl"
+  },
+  {
+    "dataset": "evaluations",
+    "original_count": 10,
+    "holdout_count": 2,
+    "training_count": 8,
+    "holdout_path": "/home/ashita/claudeworkspace/claude-evolution/datasets/evaluations-holdout.jsonl"
+  }
+]
