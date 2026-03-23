@@ -1423,13 +1423,126 @@ def jaccard_similarity(set_a: set, set_b: set) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+# Known technical terms for anchor extraction (lowercase)
+_KNOWN_TECH_TERMS = frozenset([
+    'next.js', 'astro', 'react', 'vue', 'angular', 'svelte', 'nuxt',
+    'cloudflare', 'vercel', 'aws', 'docker', 'kubernetes', 'postgresql',
+    'mongodb', 'redis', 'typescript', 'javascript', 'python', 'rust', 'go',
+    'css', 'html', 'dns', 'ci/cd', 'jwt', 'oauth', 'cors', 'xss', 'sql',
+    'graphql', 'websocket', 'ssr', 'csr', 'spa', 'seo', 'rlhf', 'llm',
+    'gpt', 'claude', 'gemini', 'opus', 'anthropic', 'openai', 'changshu',
+    'webvan', 'instacart', 'facebook', 'myspace', 'friendster',
+    'cb insights', 'khan academy', 'youtube', 'google',
+])
+
+
+def _extract_anchors(text: str) -> set:
+    """Extract high-signal anchor tokens: entities, numbers, tech terms, quoted phrases.
+
+    These tokens are preserved across paraphrases because both the manifest
+    and the model output reference the same blog post. Entities like "Next.js",
+    numbers like "40%", and proper nouns like "Changshu" appear in both
+    regardless of whether the surrounding language differs.
+    """
+    anchors = set()
+    text_lower = text.lower()
+
+    # 1. Numbers with optional units (40%, 2025, 0.34s, 8KB, 90%, 42%)
+    for m in re.findall(r'\b(\d+(?:\.\d+)?(?:%|kb|mb|ms|s|k)?)\b', text_lower):
+        anchors.add(m)
+
+    # 2. Capitalized words (proper nouns, tech terms)
+    for m in re.findall(r'\b([A-Z][a-z]+(?:\.?[a-z]+)*)\b', text):
+        if len(m) >= 3:
+            anchors.add(m.lower())
+    # ALL-CAPS acronyms (DNS, CI/CD, RLHF, etc.)
+    for m in re.findall(r'\b([A-Z]{2,}(?:/[A-Z]+)?)\b', text):
+        anchors.add(m.lower())
+
+    # 3. Known tech terms in any case context
+    for term in _KNOWN_TECH_TERMS:
+        if term in text_lower:
+            anchors.add(term)
+
+    # 4. Significant words from quoted phrases
+    for phrase in re.findall(r'"([^"]+)"', text):
+        for w in phrase.lower().split():
+            w = w.strip('.,;:!?-')
+            if len(w) >= 4 and w not in {'that', 'this', 'with', 'from', 'they',
+                                          'have', 'been', 'were', 'does', 'also',
+                                          'more', 'than', 'very', 'much', 'some',
+                                          'what', 'when', 'where', 'which', 'their'}:
+                anchors.add(w)
+
+    return anchors
+
+
+def _char_ngrams(text: str, ns: tuple = (3, 4)) -> set:
+    """Extract character n-grams from text (lowercase, whitespace-normalized).
+
+    Character n-grams catch partial word overlaps that stem-based Jaccard misses.
+    E.g., "methodology" and "methodological" share 3-grams and 4-grams.
+    """
+    cleaned = re.sub(r'\s+', ' ', text.lower().strip())
+    grams = set()
+    for n in ns:
+        for i in range(len(cleaned) - n + 1):
+            grams.add(cleaned[i:i + n])
+    return grams
+
+
+def hybrid_finding_similarity(text_a: str, text_b: str) -> float:
+    """Compute similarity between two finding descriptions using three signals.
+
+    Combines:
+    - 50% anchor overlap (Szymkiewicz-Simpson on entities/numbers/tech terms)
+    - 30% character n-gram coverage (catches partial word overlaps across paraphrases)
+    - 20% keyword Jaccard (content word stems, weakest but broadest signal)
+
+    Szymkiewicz-Simpson (overlap / min set size) handles asymmetric lengths —
+    a short model description matching against a long manifest description.
+    """
+    # Anchor component (50%): entities, numbers, tech terms
+    anchors_a = _extract_anchors(text_a)
+    anchors_b = _extract_anchors(text_b)
+
+    if anchors_a and anchors_b:
+        overlap = anchors_a & anchors_b
+        denom = min(len(anchors_a), len(anchors_b))
+        anchor_score = len(overlap) / denom if denom > 0 else 0.0
+    else:
+        anchor_score = 0.0
+
+    # Character n-gram component (30%): catches partial word overlaps
+    ngrams_a = _char_ngrams(text_a)
+    ngrams_b = _char_ngrams(text_b)
+    if ngrams_a and ngrams_b:
+        ngram_overlap = ngrams_a & ngrams_b
+        # Szymkiewicz-Simpson: overlap relative to the shorter text's n-grams
+        ngram_denom = min(len(ngrams_a), len(ngrams_b))
+        ngram_score = len(ngram_overlap) / ngram_denom if ngram_denom > 0 else 0.0
+    else:
+        ngram_score = 0.0
+
+    # Content keyword component (20%): Jaccard on stems
+    kw_a = _extract_keywords(text_a)
+    kw_b = _extract_keywords(text_b)
+    kw_score = jaccard_similarity(kw_a, kw_b)
+
+    return 0.50 * anchor_score + 0.30 * ngram_score + 0.20 * kw_score
+
+
 def match_review_findings(
     expected: List[ReviewFinding],
     actual: List[ReviewFinding],
-    threshold: float = 0.25,
+    threshold: float = 0.15,
 ) -> List[Tuple[ReviewFinding, Optional[ReviewFinding], float]]:
     """
-    Bipartite matching of expected to actual findings by keyword similarity.
+    Bipartite matching of expected to actual findings using hybrid similarity.
+
+    Uses anchor-based matching (entities, numbers, tech terms) combined with
+    keyword Jaccard. This bridges the vocabulary gap between manifest descriptions
+    (which quote the post) and model output (which uses review language).
 
     Returns list of (expected_finding, matched_actual_or_None, similarity_score).
     """
@@ -1438,7 +1551,6 @@ def match_review_findings(
     if not actual:
         return [(e, None, 0.0) for e in expected]
 
-    # Compute similarity matrix
     used_actual = set()
     matches = []
 
@@ -1449,7 +1561,7 @@ def match_review_findings(
         for i, act in enumerate(actual):
             if i in used_actual:
                 continue
-            sim = jaccard_similarity(exp.keywords, act.keywords)
+            sim = hybrid_finding_similarity(exp.description, act.description)
             if sim > best_score:
                 best_score = sim
                 best_idx = i

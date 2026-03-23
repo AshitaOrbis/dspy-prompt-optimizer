@@ -2723,9 +2723,9 @@ def publication_review_match(expected: str, actual: str) -> float:
         return 0.0
 
     # Match expected findings to actual
-    # Low threshold because models describe the same issue very differently
-    # (manifest uses post quotes; models use review language)
-    matches = match_review_findings(expected_findings, actual_findings, threshold=0.10)
+    # Hybrid matching: anchor entities (60%) + keyword Jaccard (40%)
+    # Threshold 0.15 catches entity-anchored matches while filtering noise
+    matches = match_review_findings(expected_findings, actual_findings, threshold=0.15)
 
     # Tier weights for recall
     tier_weights = {"MUST": 3.0, "SHOULD": 1.5, "NICE": 0.5}
