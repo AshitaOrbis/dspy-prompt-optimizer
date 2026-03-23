@@ -1101,3 +1101,363 @@ def extract_evaluation_details(text: str) -> EvaluationDetails:
         decision=decision,
         criteria=criteria,
     )
+
+
+# =============================================================================
+# Publication Review Extractor
+# =============================================================================
+
+@dataclass
+class ReviewFinding:
+    """A single finding from a publication review."""
+    tier: str  # MUST, SHOULD, NICE
+    description: str
+    keywords: set = None
+
+    def __post_init__(self):
+        if self.keywords is None:
+            self.keywords = _extract_keywords(self.description)
+
+
+def _extract_keywords(text: str) -> set:
+    """Extract content word stems from text for matching.
+
+    Uses crude stemming (first 5+ chars) to bridge vocabulary gaps between
+    manifest text (quotes post) and model output (uses review language).
+    """
+    # Remove markdown formatting, quotes, code, URLs
+    cleaned = re.sub(r'[*`#|"\'()\[\]{}]', ' ', text.lower())
+    cleaned = re.sub(r'https?://\S+', ' ', cleaned)
+    # Remove stopwords
+    stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+                 'would', 'could', 'should', 'may', 'might', 'can', 'shall',
+                 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+                 'as', 'into', 'through', 'during', 'before', 'after', 'above',
+                 'below', 'between', 'under', 'about', 'this', 'that', 'these',
+                 'those', 'it', 'its', 'and', 'but', 'or', 'nor', 'not', 'no',
+                 'so', 'if', 'then', 'than', 'when', 'where', 'how', 'what',
+                 'which', 'who', 'whom', 'whose', 'why', 'all', 'each', 'every',
+                 'both', 'few', 'more', 'most', 'other', 'some', 'such', 'only',
+                 'own', 'same', 'too', 'very', 'also', 'just', 'still', 'yet'}
+
+    words = set()
+    for w in cleaned.split():
+        w = w.strip('.,;:!?-—/')
+        if len(w) >= 3 and not w.isdigit() and w not in stopwords:
+            words.add(w)
+            # Add crude stem (first 5 chars) for longer words to bridge
+            # vocabulary gaps like "methodology" vs "method", "performance" vs "perform"
+            if len(w) >= 6:
+                words.add(w[:5])
+    return words
+
+
+def extract_publication_review(text: str) -> str:
+    """
+    Normalize verbose review output into structured finding format.
+
+    Handles various output formats models produce:
+    - Standard ## MUST FIX / ## SHOULD FIX / ## NICE TO HAVE headers
+    - Numbered lists without headers
+    - Table format
+    - Prose with embedded findings
+
+    Args:
+        text: Raw review output (may be verbose)
+
+    Returns:
+        Normalized text with ## MUST FIX / ## SHOULD FIX / ## NICE TO HAVE sections
+    """
+    if not text or not text.strip():
+        return ""
+
+    findings = extract_review_findings(text)
+    if not findings:
+        return text  # Return original if we can't parse
+
+    return _format_findings(findings)
+
+
+def extract_review_findings(text: str) -> List[ReviewFinding]:
+    """
+    Extract findings from review text using multiple strategies.
+
+    Returns list of ReviewFinding objects with tier, description, and keywords.
+    """
+    if not text or not text.strip():
+        return []
+
+    # Strategy 1: Parse structured headers (## MUST FIX, etc.)
+    findings = _extract_findings_from_headers(text)
+    if findings:
+        return findings
+
+    # Strategy 2: Parse table format
+    findings = _extract_findings_from_tables(text)
+    if findings:
+        return findings
+
+    # Strategy 2.5: Parse ### section headers with bullets (natural model output)
+    findings = _extract_findings_from_sections(text)
+    if findings:
+        return findings
+
+    # Strategy 3: Parse numbered lists with tier indicators
+    findings = _extract_findings_from_numbered_lists(text)
+    if findings:
+        return findings
+
+    # Strategy 4: Keyword-based extraction from prose
+    findings = _extract_findings_from_prose(text)
+    return findings
+
+
+def _extract_findings_from_headers(text: str) -> List[ReviewFinding]:
+    """Strategy 1: Parse ## MUST FIX / ## SHOULD FIX / ## NICE TO HAVE sections."""
+    findings = []
+
+    tier_patterns = [
+        ("MUST", r'##\s*MUST\s*FIX\s*\n(.*?)(?=\n##|\Z)'),
+        ("SHOULD", r'##\s*SHOULD\s*FIX\s*\n(.*?)(?=\n##|\Z)'),
+        ("NICE", r'##\s*NICE\s*(?:TO\s*)?HAVE\s*\n(.*?)(?=\n##|\Z)'),
+    ]
+
+    for tier, pattern in tier_patterns:
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+
+        section = match.group(1)
+
+        # Extract numbered items
+        items = re.findall(r'^\s*\d+\.\s*(.+?)(?=^\s*\d+\.|\Z)', section, re.MULTILINE | re.DOTALL)
+        for item in items:
+            desc = item.strip()
+            if desc and len(desc) > 10:
+                # Clean up: take first line if multi-line
+                first_line = desc.split('\n')[0].strip()
+                # Remove bold markers for keyword extraction
+                findings.append(ReviewFinding(tier=tier, description=first_line))
+
+        # Also check for bullet points if no numbered items
+        if not items:
+            bullets = re.findall(r'^\s*[-*]\s+(.+)$', section, re.MULTILINE)
+            for bullet in bullets:
+                desc = bullet.strip()
+                if desc and len(desc) > 10:
+                    findings.append(ReviewFinding(tier=tier, description=desc))
+
+        # Also check for table rows (| # | Finding | ...)
+        if not items:
+            rows = re.findall(r'\|\s*\d+\s*\|([^|]+)', section)
+            for row in rows:
+                desc = row.strip()
+                if desc and len(desc) > 10 and not desc.startswith("Finding") and not desc.startswith("---"):
+                    findings.append(ReviewFinding(tier=tier, description=desc))
+
+    return findings
+
+
+def _extract_findings_from_tables(text: str) -> List[ReviewFinding]:
+    """Strategy 2: Parse findings from markdown tables with tier columns."""
+    findings = []
+
+    # Look for tables with Priority/Tier column
+    rows = re.findall(
+        r'\|\s*\d+\s*\|\s*(MUST|SHOULD|NICE|must|should|nice)[^|]*\|([^|]+)',
+        text, re.IGNORECASE
+    )
+    for tier_str, desc in rows:
+        tier = tier_str.strip().upper()
+        if tier == "NICE":
+            tier = "NICE"
+        desc = desc.strip()
+        if desc and len(desc) > 10:
+            findings.append(ReviewFinding(tier=tier, description=desc))
+
+    return findings
+
+
+def _extract_findings_from_sections(text: str) -> List[ReviewFinding]:
+    """Strategy 2.5: Parse ### section headers with bullets (natural model output format).
+
+    Models naturally produce output like:
+        ### 1. Factual Errors & Technical Accuracy
+        *   **Claim X:** is wrong because...
+        *   **Claim Y:** needs citation...
+        ### 2. Internal Consistency
+        *   **Contradiction:** ...
+
+    Map section headers to tiers by keyword:
+        Factual/accuracy/error/incorrect/citation → MUST
+        Consistency/contradiction/tone/fairness → SHOULD
+        Style/polish/minor/suggestion/hedging → NICE
+    """
+    findings = []
+
+    # Find all ### sections
+    sections = re.split(r'\n###\s+', text)
+    if len(sections) <= 1:
+        # Try ## sections too
+        sections = re.split(r'\n##\s+', text)
+    if len(sections) <= 1:
+        return findings
+
+    must_headers = ['factual', 'accuracy', 'error', 'incorrect', 'citation',
+                    'unsupported', 'verif', 'numerical', 'evidence']
+    should_headers = ['consisten', 'contradict', 'tone', 'fairness', 'overclaim',
+                      'hedg', 'internal', 'logic', 'coherence']
+    nice_headers = ['style', 'polish', 'minor', 'suggest', 'redundan', 'sentence',
+                    'clarity', 'readability', 'nitpick']
+
+    for section in sections[1:]:  # Skip preamble before first header
+        # Get header line
+        header_line = section.split('\n')[0].lower()
+
+        # Classify tier from header
+        if any(kw in header_line for kw in must_headers):
+            tier = "MUST"
+        elif any(kw in header_line for kw in should_headers):
+            tier = "SHOULD"
+        elif any(kw in header_line for kw in nice_headers):
+            tier = "NICE"
+        else:
+            tier = "SHOULD"  # Default to SHOULD for unclassifiable sections
+
+        # Extract bullets from section
+        bullets = re.findall(r'^\s*[*\-]\s+(.+)$', section, re.MULTILINE)
+        for bullet in bullets:
+            desc = bullet.strip()
+            if desc and len(desc) > 15:
+                # Clean leading bold markers
+                desc = re.sub(r'^\*\*([^*]+)\*\*[:\s]*', r'\1: ', desc)
+                findings.append(ReviewFinding(tier=tier, description=desc[:300]))
+
+        # Also numbered items in section
+        if not bullets:
+            items = re.findall(r'^\s*\d+\.\s+(.+)$', section, re.MULTILINE)
+            for item in items:
+                desc = item.strip()
+                if desc and len(desc) > 15:
+                    desc = re.sub(r'^\*\*([^*]+)\*\*[:\s]*', r'\1: ', desc)
+                    findings.append(ReviewFinding(tier=tier, description=desc[:300]))
+
+    return findings
+
+
+def _extract_findings_from_numbered_lists(text: str) -> List[ReviewFinding]:
+    """Strategy 3: Parse numbered lists with severity/tier indicators."""
+    findings = []
+
+    patterns = [
+        r'^\s*\d+\.\s*\*?\*?\[?(MUST|SHOULD|NICE)\s*(?:FIX|TO HAVE)?\]?\*?\*?\s*[-:]\s*(.+)',
+        r'^\s*\d+\.\s*\*?\*?\((MUST|SHOULD|NICE)\)\*?\*?\s*[-:]\s*(.+)',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+        for tier_str, desc in matches:
+            tier = tier_str.strip().upper()
+            desc = desc.strip()
+            if desc and len(desc) > 10:
+                findings.append(ReviewFinding(tier=tier, description=desc))
+
+    return findings
+
+
+def _extract_findings_from_prose(text: str) -> List[ReviewFinding]:
+    """Strategy 4: Extract from prose using severity keywords."""
+    findings = []
+    text_lower = text.lower()
+
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    must_keywords = ['factual error', 'incorrect', 'wrong', 'false', 'contradicts',
+                     'unsupported claim', 'no evidence', 'citation needed', 'misleading']
+    should_keywords = ['overclaim', 'overstated', 'hedge', 'qualification needed',
+                       'tone', 'could be clearer', 'ambiguous']
+
+    for sentence in sentences:
+        s_lower = sentence.lower()
+        if any(kw in s_lower for kw in must_keywords):
+            findings.append(ReviewFinding(tier="MUST", description=sentence.strip()[:200]))
+        elif any(kw in s_lower for kw in should_keywords):
+            findings.append(ReviewFinding(tier="SHOULD", description=sentence.strip()[:200]))
+
+    return findings
+
+
+def _format_findings(findings: List[ReviewFinding]) -> str:
+    """Format findings into standard ## MUST FIX / ## SHOULD FIX / ## NICE TO HAVE structure."""
+    sections = {"MUST": [], "SHOULD": [], "NICE": []}
+    for f in findings:
+        sections[f.tier].append(f.description)
+
+    parts = []
+    if sections["MUST"]:
+        parts.append("## MUST FIX")
+        for i, desc in enumerate(sections["MUST"], 1):
+            parts.append(f"{i}. {desc}")
+
+    if sections["SHOULD"]:
+        parts.append("\n## SHOULD FIX")
+        for i, desc in enumerate(sections["SHOULD"], 1):
+            parts.append(f"{i}. {desc}")
+
+    if sections["NICE"]:
+        parts.append("\n## NICE TO HAVE")
+        for i, desc in enumerate(sections["NICE"], 1):
+            parts.append(f"{i}. {desc}")
+
+    return "\n".join(parts)
+
+
+def jaccard_similarity(set_a: set, set_b: set) -> float:
+    """Compute Jaccard similarity between two sets."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def match_review_findings(
+    expected: List[ReviewFinding],
+    actual: List[ReviewFinding],
+    threshold: float = 0.25,
+) -> List[Tuple[ReviewFinding, Optional[ReviewFinding], float]]:
+    """
+    Bipartite matching of expected to actual findings by keyword similarity.
+
+    Returns list of (expected_finding, matched_actual_or_None, similarity_score).
+    """
+    if not expected:
+        return []
+    if not actual:
+        return [(e, None, 0.0) for e in expected]
+
+    # Compute similarity matrix
+    used_actual = set()
+    matches = []
+
+    for exp in expected:
+        best_score = 0.0
+        best_idx = -1
+
+        for i, act in enumerate(actual):
+            if i in used_actual:
+                continue
+            sim = jaccard_similarity(exp.keywords, act.keywords)
+            if sim > best_score:
+                best_score = sim
+                best_idx = i
+
+        if best_score >= threshold and best_idx >= 0:
+            used_actual.add(best_idx)
+            matches.append((exp, actual[best_idx], best_score))
+        else:
+            matches.append((exp, None, 0.0))
+
+    return matches

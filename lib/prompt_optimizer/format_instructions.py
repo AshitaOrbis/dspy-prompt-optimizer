@@ -111,6 +111,31 @@ Using describe/it/expect pattern
 2. should [behavior] when [condition]
 """,
 
+    "publication_review": """
+## Output Format
+
+Organize your findings into three priority tiers:
+
+## MUST FIX
+1. **[Brief title]** — [Why it's wrong and what to fix]
+2. ...
+
+## SHOULD FIX
+1. **[Brief title]** — [Why it matters and suggested correction]
+2. ...
+
+## NICE TO HAVE
+1. **[Brief title]** — [Suggested improvement]
+2. ...
+
+Rules:
+- MUST FIX: Factual errors, unsupported claims, internal contradictions
+- SHOULD FIX: Overclaims, hedging issues, consistency gaps, tone problems
+- NICE TO HAVE: Sentence-level polish, minor redundancy, stylistic preferences
+- Cite exact text when flagging issues
+- If no issues in a tier, omit that section
+""",
+
     "default": """
 ## Output Format
 
@@ -131,6 +156,8 @@ METRIC_FORMAT_MAP = {
     "security_cwe_match": "severity_classification",
     "test_coverage_score": "test_coverage",
     "complexity_classification": "tier_classification",
+    # Publication review
+    "publication_review_match": "publication_review",
 }
 
 
@@ -180,6 +207,10 @@ def get_format_type_for_target(target_name: str) -> str:
         "test-writer": "test_coverage",
         "performance-analyzer": "tier_classification",
         "capability-evaluator": "evaluation_score",
+        # Publication review targets
+        "publication-review-gpt": "publication_review",
+        "publication-review-gemini": "publication_review",
+        "publication-review-opus": "publication_review",
     }
 
     return target_format_map.get(target_name, "default")

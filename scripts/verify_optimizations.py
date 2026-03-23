@@ -58,6 +58,15 @@ from prompt_optimizer import (
     refactoring_match,
     # Plan quality metric
     plan_quality_match,
+    # Tier 2 agent metrics
+    discovery_quality_match,
+    fact_check_quality_match,
+    research_quality_match,
+    # Tier 3 skill metrics
+    writing_review_quality_match,
+    handoff_quality_match,
+    # Publication review metric
+    publication_review_match,
     # Skill-specific metrics
     routing_accuracy,
     binary_decision_match,
@@ -81,6 +90,10 @@ AGENT_METRICS = {
     "pr-preparer": pr_quality_match,
     "feature-implementer": implementation_completeness,
     "refactoring-advisor": refactoring_match,
+    # Tier 2 agents
+    "capability-discoverer": discovery_quality_match,
+    "fact-checker": fact_check_quality_match,
+    "web-researcher": research_quality_match,
 }
 
 SKILL_METRICS = {
@@ -88,6 +101,13 @@ SKILL_METRICS = {
     "mgrep-guide": binary_decision_match,
     "advanced-tool-use": tool_tier_classification,
     "plan-mode-quality": plan_quality_match,
+    # Tier 3 skills
+    "writing-review": writing_review_quality_match,
+    "session-handoff": handoff_quality_match,
+    # Publication review (per-model targets)
+    "publication-review-gpt": publication_review_match,
+    "publication-review-gemini": publication_review_match,
+    "publication-review-opus": publication_review_match,
 }
 
 # Data file mappings
@@ -102,6 +122,10 @@ AGENT_DATA_PATHS = {
     "pr-preparer": "pr-preparations",
     "feature-implementer": "feature-implementations",
     "refactoring-advisor": "refactoring-decisions",
+    # Tier 2 agents
+    "capability-discoverer": "discoveries",
+    "fact-checker": "fact-checks",
+    "web-researcher": "web-research",
 }
 
 SKILL_DATA_PATHS = {
@@ -109,6 +133,13 @@ SKILL_DATA_PATHS = {
     "mgrep-guide": "search-decisions",
     "advanced-tool-use": "tool-selection",
     "plan-mode-quality": "plan-quality",
+    # Tier 3 skills
+    "writing-review": "writing-reviews",
+    "session-handoff": "session-handoffs",
+    # Publication review (per-model targets)
+    "publication-review-gpt": "publication-review-gpt",
+    "publication-review-gemini": "publication-review-gemini",
+    "publication-review-opus": "publication-review-opus",
 }
 
 

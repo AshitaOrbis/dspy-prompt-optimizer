@@ -21,6 +21,8 @@ from .extractors import (
     extract_severity_details,
     extract_test_coverage_details,
     extract_evaluation_details,
+    # Publication review extractor
+    extract_review_findings,
 )
 
 
@@ -353,6 +355,74 @@ def transform_evaluation_demo(
     )
 
 
+def transform_review_demo(
+    input_text: str,
+    output_text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> TransformedDemo:
+    """
+    Transform verbose publication review demo into structured format.
+
+    Input side: Truncate blog post to first 500 words + [...truncated...]
+    Output side: Condense to structured finding list (~200 words)
+    Keeps each demo under ~1000 tokens, allowing 3 demos within budget.
+
+    Args:
+        input_text: Original input (blog post text)
+        output_text: Verbose review output
+        metadata: Optional metadata dict
+
+    Returns:
+        TransformedDemo with condensed input and output (~1000 tokens total)
+    """
+    # Truncate input to ~500 words
+    words = input_text.split()
+    if len(words) > 500:
+        truncated_input = " ".join(words[:500]) + "\n\n[...truncated...]"
+    else:
+        truncated_input = input_text
+
+    # Extract and condense findings
+    findings = extract_review_findings(output_text)
+
+    if findings:
+        # Build condensed output
+        sections = {"MUST": [], "SHOULD": [], "NICE": []}
+        for f in findings:
+            sections[f.tier].append(f.description[:100])
+
+        lines = []
+        if sections["MUST"]:
+            lines.append("## MUST FIX")
+            for i, desc in enumerate(sections["MUST"][:3], 1):  # Max 3 per tier
+                lines.append(f"{i}. {desc}")
+        if sections["SHOULD"]:
+            lines.append("## SHOULD FIX")
+            for i, desc in enumerate(sections["SHOULD"][:3], 1):
+                lines.append(f"{i}. {desc}")
+        if sections["NICE"]:
+            lines.append("## NICE TO HAVE")
+            for i, desc in enumerate(sections["NICE"][:2], 1):  # Max 2 for NICE
+                lines.append(f"{i}. {desc}")
+
+        structured = "\n".join(lines)
+    else:
+        # Couldn't extract findings, truncate original
+        structured = output_text[:500] + "..." if len(output_text) > 500 else output_text
+
+    # Ensure output stays under ~200 words
+    output_words = structured.split()
+    if len(output_words) > 200:
+        structured = " ".join(output_words[:200]) + "..."
+
+    return TransformedDemo(
+        input_text=truncated_input,
+        output_text=structured,
+        original_output=output_text,
+        transformation_applied="publication_review",
+    )
+
+
 def _extract_reason(text: str, selection: str) -> str:
     """
     Extract a brief reason from verbose output.
@@ -422,6 +492,9 @@ TRANSFORMER_MAP: Dict[str, Callable] = {
     "test_coverage_score": transform_test_coverage_demo,
     "evaluation": transform_evaluation_demo,
     "evaluation_score": transform_evaluation_demo,
+    # Publication review
+    "publication_review": transform_review_demo,
+    "publication_review_match": transform_review_demo,
     "default": transform_passthrough,
 }
 
@@ -437,6 +510,10 @@ TARGET_TRANSFORMER_MAP: Dict[str, Callable] = {
     "security-auditor": transform_severity_demo,
     "test-writer": transform_test_coverage_demo,
     "capability-evaluator": transform_evaluation_demo,
+    # Publication review targets
+    "publication-review-gpt": transform_review_demo,
+    "publication-review-gemini": transform_review_demo,
+    "publication-review-opus": transform_review_demo,
 }
 
 

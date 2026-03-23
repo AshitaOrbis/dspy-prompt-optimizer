@@ -45,10 +45,22 @@ from prompt_optimizer import (
     test_coverage_score,
     complexity_classification,
     security_cwe_match,
+    # Tier 1 agent metrics
+    pr_quality_match,
+    refactoring_match,
+    # Tier 2 agent metrics
+    discovery_quality_match,
+    fact_check_quality_match,
+    research_quality_match,
     # Skill-specific metrics
     routing_accuracy,
     binary_decision_match,
     tool_tier_classification,
+    # Tier 3 skill metrics
+    writing_review_quality_match,
+    handoff_quality_match,
+    # Publication review metric
+    publication_review_match,
     # Phase 3: COPRO and Iterative
     COPROOptimizer,
     IterativeOptimizer,
@@ -75,6 +87,13 @@ AGENT_METRICS = {
     "security-auditor": security_cwe_match,
     "performance-analyzer": complexity_classification,
     "capability-evaluator": evaluation_score_metric(threshold=70.0),
+    # Tier 1
+    "pr-preparer": pr_quality_match,
+    "refactoring-advisor": refactoring_match,
+    # Tier 2
+    "capability-discoverer": discovery_quality_match,
+    "fact-checker": fact_check_quality_match,
+    "web-researcher": research_quality_match,
 }
 
 SKILL_METRICS = {
@@ -82,6 +101,13 @@ SKILL_METRICS = {
     "mgrep-guide": binary_decision_match,
     "advanced-tool-use": tool_tier_classification,
     "dispatching-parallel-agents": binary_decision_match,
+    # Tier 3
+    "writing-review": writing_review_quality_match,
+    "session-handoff": handoff_quality_match,
+    # Publication review (per-model targets — use dedicated script for optimization)
+    "publication-review-gpt": publication_review_match,
+    "publication-review-gemini": publication_review_match,
+    "publication-review-opus": publication_review_match,
 }
 
 # Default training data paths (relative to data_dir)
@@ -91,12 +117,26 @@ AGENT_DATA_PATHS = {
     "security-auditor": "security-audits.jsonl",
     "performance-analyzer": "performance-analysis.jsonl",
     "capability-evaluator": "evaluations.jsonl",
+    # Tier 1
+    "pr-preparer": "pr-preparations.jsonl",
+    "refactoring-advisor": "refactoring-decisions.jsonl",
+    # Tier 2
+    "capability-discoverer": "discoveries.jsonl",
+    "fact-checker": "fact-checks.jsonl",
+    "web-researcher": "web-research.jsonl",
 }
 
 SKILL_DATA_PATHS = {
     "mcp-search-framework": "search-routing.jsonl",
     "mgrep-guide": "search-decisions.jsonl",
     "advanced-tool-use": "tool-selection.jsonl",
+    # Tier 3
+    "writing-review": "writing-reviews.jsonl",
+    "session-handoff": "session-handoffs.jsonl",
+    # Publication review (per-model targets)
+    "publication-review-gpt": "publication-review-gpt.jsonl",
+    "publication-review-gemini": "publication-review-gemini.jsonl",
+    "publication-review-opus": "publication-review-opus.jsonl",
 }
 
 

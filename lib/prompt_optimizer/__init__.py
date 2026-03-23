@@ -43,6 +43,15 @@ from .metrics import (
     routing_accuracy,
     binary_decision_match,
     tool_tier_classification,
+    # Tier 2: Agent metrics
+    discovery_quality_match,
+    fact_check_quality_match,
+    research_quality_match,
+    # Tier 3: Skill metrics
+    writing_review_quality_match,
+    handoff_quality_match,
+    # Publication review metric
+    publication_review_match,
 )
 from .storage import DemoStorage
 from .diversity import (
@@ -99,6 +108,11 @@ from .extractors import (
     extract_binary_decision,
     extract_tier,
     score_tool_match,
+    # Publication review
+    extract_publication_review,
+    extract_review_findings,
+    match_review_findings,
+    ReviewFinding,
 )
 from .format_instructions import (
     get_format_instruction,
@@ -110,8 +124,15 @@ from .demo_transformers import (
     transform_routing_demo,
     transform_binary_demo,
     transform_tier_demo,
+    transform_review_demo,
     transform_demo_list,
     TransformedDemo,
+)
+from .model_runners import (
+    ModelRunner,
+    CodexModelRunner,
+    GeminiModelRunner,
+    get_runner_for_model,
 )
 
 __version__ = "0.5.0"  # Security hardening (2026-06-11 review)
@@ -188,6 +209,12 @@ __all__ = [
     "extract_binary_decision",
     "extract_tier",
     "score_tool_match",
+    # Publication review
+    "extract_publication_review",
+    "extract_review_findings",
+    "match_review_findings",
+    "ReviewFinding",
+    "publication_review_match",
     # Phase 6: Format instructions
     "get_format_instruction",
     "get_format_type_for_target",
@@ -198,5 +225,11 @@ __all__ = [
     "transform_binary_demo",
     "transform_tier_demo",
     "transform_demo_list",
+    "transform_review_demo",
     "TransformedDemo",
+    # Model runners
+    "ModelRunner",
+    "CodexModelRunner",
+    "GeminiModelRunner",
+    "get_runner_for_model",
 ]

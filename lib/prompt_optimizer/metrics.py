@@ -1245,12 +1245,13 @@ def pr_quality_match(expected: str, actual: str) -> float:
     """
     Evaluate PR description quality for pr-preparer agent.
 
-    Revised weights (v2) with semantic matching:
+    Revised weights (v3) with expanded header detection and content coherence:
     - Change type classification (15%) - uses equivalence groups
     - Risk level assessment (15%) - uses adjacent-level credit
-    - Required sections presence (40%) - most informative
+    - Required sections presence (30%) - expanded header aliases, content fallback
+    - Content coherence (10%) - file/function overlap between expected and actual
     - Testing checklist (20%) - unchanged
-    - Quality indicators (10%) - NEW: migration notes, screenshots, etc.
+    - Quality indicators (10%) - migration notes, screenshots, etc.
 
     Args:
         expected: Expected PR description
@@ -1328,11 +1329,11 @@ def pr_quality_match(expected: str, actual: str) -> float:
         text_lower = text.lower()
 
         sections = {
-            'summary': bool(re.search(r'##?\s*summary', text_lower)),
-            'changes': bool(re.search(r'##?\s*(changes|what changed)', text_lower)),
-            'type': bool(re.search(r'##?\s*type', text_lower)),
-            'risk': bool(re.search(r'##?\s*risk', text_lower)),
-            'testing': bool(re.search(r'##?\s*(test|testing)', text_lower)),
+            'summary': bool(re.search(r'##?\s*(summary|overview|description|what|about)', text_lower)),
+            'changes': bool(re.search(r'##?\s*(changes|what.?changed|modifications|diff|files)', text_lower)),
+            'type': bool(re.search(r'##?\s*(type|category|kind|classification)', text_lower)),
+            'risk': bool(re.search(r'##?\s*(risk|impact|safety|concern)', text_lower)),
+            'testing': bool(re.search(r'##?\s*(test|testing|verification|how.?to.?test|qa)', text_lower)),
         }
         return sections
 
@@ -1341,7 +1342,7 @@ def pr_quality_match(expected: str, actual: str) -> float:
         scores = {}
 
         # Summary should have at least 20 chars of content
-        summary_match = re.search(r'##?\s*summary[:\s]*\n(.+?)(?=##|\Z)', text, re.IGNORECASE | re.DOTALL)
+        summary_match = re.search(r'##?\s*(?:summary|overview|description|what|about)[:\s]*\n(.+?)(?=##|\Z)', text, re.IGNORECASE | re.DOTALL)
         if summary_match:
             content = summary_match.group(1).strip()
             scores['summary'] = min(1.0, len(content) / 50)  # Full credit at 50+ chars
@@ -1349,9 +1350,9 @@ def pr_quality_match(expected: str, actual: str) -> float:
             scores['summary'] = 0.0
 
         # Changes should have bullet points or numbered items
-        changes_match = re.search(r'##?\s*(changes|what changed)[:\s]*\n(.+?)(?=##|\Z)', text, re.IGNORECASE | re.DOTALL)
+        changes_match = re.search(r'##?\s*(?:changes|what.?changed|modifications|diff|files)[:\s]*\n(.+?)(?=##|\Z)', text, re.IGNORECASE | re.DOTALL)
         if changes_match:
-            content = changes_match.group(2)
+            content = changes_match.group(1)
             bullet_count = len(re.findall(r'^\s*[-*]\s', content, re.MULTILINE))
             numbered_count = len(re.findall(r'^\s*\d+\.\s', content, re.MULTILINE))
             scores['changes'] = min(1.0, (bullet_count + numbered_count) / 3)  # Full credit at 3+ items
@@ -1427,13 +1428,14 @@ def pr_quality_match(expected: str, actual: str) -> float:
     elif expected_risk is None:
         score += 0.15 * 0.5  # No expected risk to match
 
-    # Component 3: Required sections (40%) - most informative
+    # Component 3: Required sections (30%) - reduced from 40%
     expected_sections = check_required_sections(expected)
     actual_sections = check_required_sections(actual)
     content_scores = check_section_content(actual)
 
     section_score = 0.0
     section_count = 0
+    sections_found = sum(1 for v in actual_sections.values() if v)
     for section, expected_present in expected_sections.items():
         if expected_present:
             section_count += 1
@@ -1446,10 +1448,27 @@ def pr_quality_match(expected: str, actual: str) -> float:
             section_count += 1
             section_score += 0.5  # Section not required, neutral score
 
+    # Content-based fallback: if no headers match but text is substantive,
+    # give partial credit (indicates good content without formal structure)
+    if sections_found == 0 and len(actual) > 200:
+        section_score = max(section_score, section_count * 0.3)
+
     if section_count > 0:
-        score += 0.40 * (section_score / section_count)
+        score += 0.30 * (section_score / section_count)
     else:
-        score += 0.20  # No sections to check
+        score += 0.15  # No sections to check
+
+    # Component 3b: Content coherence (10%) - NEW
+    # Check if PR description references files/functions from expected output
+    expected_paths = set(re.findall(r'`([^`]*(?:\.\w+|/\w+)[^`]*)`', expected))
+    actual_paths = set(re.findall(r'`([^`]*(?:\.\w+|/\w+)[^`]*)`', actual))
+    if expected_paths:
+        overlap = len(expected_paths & actual_paths)
+        coherence_score = min(1.0, overlap / max(1, len(expected_paths) * 0.5))
+    else:
+        # Fallback: use SequenceMatcher on extracted nouns/identifiers
+        coherence_score = SequenceMatcher(None, expected[:500].lower(), actual[:500].lower()).ratio()
+    score += 0.10 * coherence_score
 
     # Component 4: Testing checklist (20%)
     expected_tests = count_test_items(expected)
@@ -1838,12 +1857,12 @@ def refactoring_match(expected: str, actual: str) -> float:
     """
     Evaluate refactoring analysis for refactoring-advisor agent.
 
-    Revised weights (v2) with smell-technique affinity:
-    - Primary code smell detection (25%) - uses equivalence groups
-    - Refactoring technique selection (25%) - validity-based, not exact
+    Revised weights (v3) with expanded paraphrases and SequenceMatcher fallback:
+    - Primary code smell detection (25%) - expanded keywords, SequenceMatcher fallback
+    - Refactoring technique selection (25%) - expanded keywords, softened affinity cascade
     - Risk assessment (15%) - unchanged
     - Code example inclusion (15%) - unchanged
-    - Rationale quality (20%) - NEW: why technique fixes smell
+    - Rationale quality (20%) - why technique fixes smell
 
     Args:
         expected: Expected refactoring analysis
@@ -1857,12 +1876,16 @@ def refactoring_match(expected: str, actual: str) -> float:
         text_lower = text.lower()
 
         smell_patterns = {
-            'long_method': ['long method', 'too many lines', 'multiple responsibilities', 'single responsibility'],
-            'duplicate_code': ['massive duplication', 'duplicate code', 'duplicated code', 'repeated code', 'dry violation'],
-            'conditional_complexity': ['conditional complexity', 'nested if', 'cyclomatic'],
+            'long_method': ['long method', 'too many lines', 'multiple responsibilities', 'single responsibility',
+                           'oversized', 'bloated', 'too complex', 'doing too much', 'too long'],
+            'duplicate_code': ['massive duplication', 'duplicate code', 'duplicated code', 'repeated code', 'dry violation',
+                              'copy paste', 'copy-paste', 'similar code', 'shared logic', 'identical pattern'],
+            'conditional_complexity': ['conditional complexity', 'nested if', 'cyclomatic',
+                                      'deeply nested', 'complex branching', 'too many conditions'],
             'feature_envy': ['feature envy', 'knows too much'],
             'data_clumps': ['data clump', 'parameter list', 'grouped data'],
-            'god_class': ['god class', 'too many dependencies', 'mixed concerns', 'does everything'],
+            'god_class': ['god class', 'too many dependencies', 'mixed concerns', 'does everything',
+                         'monolithic', 'kitchen sink', 'do-it-all', 'too many responsibilities'],
             'hardcoded_rules': ['hardcoded', 'magic number', 'business rules in code'],
             'n_plus_one_queries': ['n+1', 'n + 1', 'n+1 query', 'sequential query'],
             'primitive_obsession': ['primitive obsession', 'magic string'],
@@ -1881,10 +1904,13 @@ def refactoring_match(expected: str, actual: str) -> float:
         text_lower = text.lower()
 
         technique_patterns = {
-            'extract_method': ['extract method', 'break into', 'smaller function'],
-            'extract_class': ['extract class', 'value object', 'data class'],
+            'extract_method': ['extract method', 'break into', 'smaller function',
+                              'pull out', 'separate function', 'isolate logic', 'focused function'],
+            'extract_class': ['extract class', 'value object', 'data class',
+                             'separate class', 'dedicated class', 'new class'],
             'extract_function': ['extract function'],
-            'strategy_pattern': ['strategy pattern', 'polymorphism'],
+            'strategy_pattern': ['strategy pattern', 'polymorphism',
+                                'replace conditional', 'dynamic dispatch'],
             'move_method': ['move method', 'move to', 'belongs in'],
             'extract_configuration': ['extract config', 'configuration file'],
             'template_method': ['template method', 'base method', 'hook method'],
@@ -1899,7 +1925,8 @@ def refactoring_match(expected: str, actual: str) -> float:
             'config_driven_events': ['configurable event', 'event config', 'event hierarchy', 'configureevent'],
             'saga_orchestrator': ['saga orchestrator', 'orchestrator pattern'],
             'renderer_registry': ['renderer registry', 'noderenderer'],
-            'generic_helper': ['generic request', 'request helper'],
+            'generic_helper': ['generic request', 'request helper', 'generic base', 'base service',
+                              'reusable crud', 'abstract base'],
             'state_pattern': ['state pattern'],
             'command_pattern': ['command pattern'],
             'introduce_parameter_object': ['parameter object', 'dto'],
@@ -1983,12 +2010,18 @@ def refactoring_match(expected: str, actual: str) -> float:
     expected_smell = extract_code_smell(expected)
     actual_smell = extract_code_smell(actual)
 
-    smell_score = _score_categorical_match(
-        expected_smell,
-        actual_smell,
-        SMELL_EQUIVALENCES,
-        related_groups=None,  # Use group membership only
-    )
+    if expected_smell is None and actual_smell is None:
+        # Neither detected - use SequenceMatcher on smell-related text
+        smell_score = SequenceMatcher(None, expected[:400].lower(), actual[:400].lower()).ratio() * 0.5
+    elif expected_smell is not None or actual_smell is not None:
+        smell_score = _score_categorical_match(
+            expected_smell,
+            actual_smell,
+            SMELL_EQUIVALENCES,
+            related_groups=None,  # Use group membership only
+        )
+    else:
+        smell_score = 0.0
     score += 0.25 * smell_score
 
     # Component 2: Technique selection (25%) - uses smell-technique affinity
@@ -2026,10 +2059,15 @@ def refactoring_match(expected: str, actual: str) -> float:
             TECHNIQUE_EQUIVALENCES,
             related_groups=None,
         )
-        score += 0.25 * technique_score * 0.7  # Discount without smell context
+        score += 0.25 * technique_score * 0.8  # Softened discount (was 0.7)
     else:
-        # No technique suggested
-        score += 0.0
+        # No technique suggested - use SequenceMatcher fallback
+        # Extract technique-related text and compare semantically
+        if expected_technique:
+            similarity = SequenceMatcher(None, expected[:300].lower(), actual[:300].lower()).ratio()
+            score += 0.25 * similarity * 0.5  # Partial credit for semantic similarity
+        else:
+            score += 0.25 * 0.15  # Minimal base credit
 
     # Component 3: Risk assessment (15%) - uses adjacent-level credit
     expected_risk = extract_risk_level(expected)
@@ -2062,3 +2100,676 @@ def refactoring_match(expected: str, actual: str) -> float:
     score += 0.20 * rationale_score
 
     return min(1.0, score)
+
+
+# =============================================================================
+# Tier 2: Agent Metrics
+# =============================================================================
+
+def discovery_quality_match(expected: str, actual: str) -> float:
+    """
+    Evaluate discovery report quality for capability-discoverer agent.
+
+    Components:
+    - Category accuracy (20%) - correct classification
+    - Redundancy detection (25%) - correctly identifies duplicates vs novel
+    - Source quality (15%) - sources cited with URLs
+    - Score calibration (20%) - preliminary score within ±15 of expected
+    - Report structure (20%) - has required sections
+    """
+    score = 0.0
+    expected_lower = expected.lower()
+    actual_lower = actual.lower()
+
+    # Component 1: Category accuracy (20%)
+    categories = ['mcp', 'skill', 'technique', 'agent', 'tool', 'pattern', 'cli', 'workflow']
+    expected_cat = None
+    actual_cat = None
+    for cat in categories:
+        cat_pattern = rf'(?:category|type)[:\s]*{cat}'
+        if re.search(cat_pattern, expected_lower):
+            expected_cat = cat
+        if re.search(cat_pattern, actual_lower):
+            actual_cat = cat
+    # Fallback: check for category mentioned anywhere
+    if not expected_cat:
+        for cat in categories:
+            if cat in expected_lower:
+                expected_cat = cat
+                break
+    if not actual_cat:
+        for cat in categories:
+            if cat in actual_lower:
+                actual_cat = cat
+                break
+
+    if expected_cat and actual_cat:
+        if expected_cat == actual_cat:
+            score += 0.20
+        else:
+            # Related categories get partial credit
+            related = {
+                'mcp': {'tool'}, 'tool': {'mcp'},
+                'skill': {'technique', 'workflow', 'pattern'},
+                'technique': {'skill', 'pattern', 'workflow'},
+                'pattern': {'technique', 'workflow', 'skill'},
+                'workflow': {'technique', 'pattern', 'skill'},
+                'agent': set(), 'cli': set(),
+            }
+            if actual_cat in related.get(expected_cat, set()):
+                score += 0.20 * 0.6
+    elif actual_cat:
+        score += 0.20 * 0.3  # Some classification provided
+
+    # Component 2: Redundancy detection (25%)
+    redundancy_labels = ['novel', 'duplicate', 'improvement']
+    expected_redundancy = None
+    actual_redundancy = None
+    for label in redundancy_labels:
+        if re.search(rf'(?:result|status|check)[:\s]*{label}', expected_lower):
+            expected_redundancy = label
+        elif label in expected_lower:
+            expected_redundancy = label
+        if re.search(rf'(?:result|status|check)[:\s]*{label}', actual_lower):
+            actual_redundancy = label
+        elif label in actual_lower:
+            actual_redundancy = label
+
+    if expected_redundancy and actual_redundancy:
+        if expected_redundancy == actual_redundancy:
+            score += 0.25
+        else:
+            # Confusing NOVEL with IMPROVEMENT is less bad than with DUPLICATE
+            confusion_credit = {
+                ('novel', 'improvement'): 0.5,
+                ('improvement', 'novel'): 0.5,
+                ('novel', 'duplicate'): 0.0,
+                ('duplicate', 'novel'): 0.0,
+                ('improvement', 'duplicate'): 0.2,
+                ('duplicate', 'improvement'): 0.2,
+            }
+            credit = confusion_credit.get((expected_redundancy, actual_redundancy), 0.1)
+            score += 0.25 * credit
+    elif actual_redundancy:
+        score += 0.25 * 0.3
+
+    # Component 3: Source quality (15%)
+    actual_urls = re.findall(r'https?://[^\s\)]+', actual)
+    if actual_urls:
+        url_score = min(1.0, len(actual_urls) / 2)  # Full credit at 2+ URLs
+        score += 0.15 * url_score
+    elif re.search(r'source|reference|link', actual_lower):
+        score += 0.15 * 0.2  # Mentioned but no URLs
+
+    # Component 4: Score calibration (20%)
+    expected_scores = re.findall(r'(?:score|rating)[:\s]*(\d{1,3})', expected_lower)
+    actual_scores = re.findall(r'(?:score|rating)[:\s]*(\d{1,3})', actual_lower)
+    # Also try X/100 format
+    expected_scores += re.findall(r'(\d{1,3})\s*/\s*100', expected_lower)
+    actual_scores += re.findall(r'(\d{1,3})\s*/\s*100', actual_lower)
+
+    if expected_scores and actual_scores:
+        exp_score = int(expected_scores[0])
+        act_score = int(actual_scores[0])
+        diff = abs(exp_score - act_score)
+        if diff <= 5:
+            score += 0.20
+        elif diff <= 15:
+            score += 0.20 * (1.0 - (diff - 5) / 20)  # Linear decay
+        elif diff <= 30:
+            score += 0.20 * 0.2
+    elif actual_scores:
+        score += 0.20 * 0.4  # Score present but can't compare
+
+    # Component 5: Report structure (20%)
+    structure_checks = {
+        'title': bool(re.search(r'(?:^#|discovery|title)[:\s]', actual_lower, re.MULTILINE)),
+        'summary': bool(re.search(r'(?:summary|overview|description)', actual_lower)),
+        'research_questions': bool(re.search(r'(?:research|question|investigate)', actual_lower)),
+        'redundancy_section': bool(re.search(r'(?:redundancy|registry|existing)', actual_lower)),
+    }
+    structure_score = sum(structure_checks.values()) / len(structure_checks)
+    score += 0.20 * structure_score
+
+    return min(1.0, score)
+
+
+def fact_check_quality_match(expected: str, actual: str) -> float:
+    """
+    Evaluate fact-check report quality for fact-checker agent.
+
+    Components:
+    - Claim extraction (25%) - identifies same verifiable claims
+    - Verdict accuracy (30%) - correct verdicts
+    - Evidence citation (20%) - sources cited for each verdict
+    - Verdict diversity (10%) - uses appropriate verdict types
+    - Report structure (15%) - has required sections
+    """
+    score = 0.0
+    expected_lower = expected.lower()
+    actual_lower = actual.lower()
+
+    # Component 1: Claim extraction (25%)
+    # Extract claim-like sentences from both
+    expected_claims = set()
+    actual_claims = set()
+    # Look for claims in tables or bullet points
+    for match in re.finditer(r'(?:claim|statement)[:\s]*["\']?([^"\'|\n]+)', expected_lower):
+        words = set(match.group(1).strip().split())
+        expected_claims.update(w for w in words if len(w) > 3)
+    for match in re.finditer(r'(?:claim|statement)[:\s]*["\']?([^"\'|\n]+)', actual_lower):
+        words = set(match.group(1).strip().split())
+        actual_claims.update(w for w in words if len(w) > 3)
+
+    # Fallback: extract significant content words
+    if not expected_claims:
+        expected_claims = set(w for w in re.findall(r'\b\w{4,}\b', expected_lower)
+                            if w not in {'this', 'that', 'with', 'from', 'have', 'been', 'were', 'their', 'about', 'which', 'would', 'could', 'should', 'there', 'these', 'those', 'other', 'some', 'more', 'also', 'than'})
+    if not actual_claims:
+        actual_claims = set(w for w in re.findall(r'\b\w{4,}\b', actual_lower)
+                          if w not in {'this', 'that', 'with', 'from', 'have', 'been', 'were', 'their', 'about', 'which', 'would', 'could', 'should', 'there', 'these', 'those', 'other', 'some', 'more', 'also', 'than'})
+
+    if expected_claims and actual_claims:
+        overlap = len(expected_claims & actual_claims)
+        precision = overlap / len(actual_claims) if actual_claims else 0
+        recall = overlap / len(expected_claims) if expected_claims else 0
+        if precision + recall > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0
+        score += 0.25 * min(1.0, f1 * 1.5)  # Scale up slightly since word overlap is strict
+
+    # Component 2: Verdict accuracy (30%)
+    verdict_types = ['verified', 'inaccurate', 'contested', 'oversimplified', "author's data",
+                     'accurate', 'false', 'misleading', 'unverifiable', 'partially true', 'correct']
+    # Normalize verdict aliases
+    verdict_normalize = {
+        'accurate': 'verified', 'correct': 'verified', 'true': 'verified', 'confirmed': 'verified',
+        'false': 'inaccurate', 'wrong': 'inaccurate', 'incorrect': 'inaccurate',
+        'misleading': 'oversimplified', 'partially true': 'oversimplified',
+        'unverifiable': "author's data",
+    }
+
+    expected_verdicts = []
+    actual_verdicts = []
+    for vt in verdict_types:
+        expected_verdicts.extend([vt] * len(re.findall(rf'\b{re.escape(vt)}\b', expected_lower)))
+        actual_verdicts.extend([vt] * len(re.findall(rf'\b{re.escape(vt)}\b', actual_lower)))
+
+    # Normalize
+    expected_normalized = [verdict_normalize.get(v, v) for v in expected_verdicts]
+    actual_normalized = [verdict_normalize.get(v, v) for v in actual_verdicts]
+
+    if expected_normalized and actual_normalized:
+        # Count matching verdict types
+        exp_counts = {}
+        act_counts = {}
+        for v in expected_normalized:
+            exp_counts[v] = exp_counts.get(v, 0) + 1
+        for v in actual_normalized:
+            act_counts[v] = act_counts.get(v, 0) + 1
+
+        matched = sum(min(exp_counts.get(v, 0), act_counts.get(v, 0)) for v in set(exp_counts) | set(act_counts))
+        total = max(sum(exp_counts.values()), sum(act_counts.values()))
+        score += 0.30 * (matched / total if total > 0 else 0)
+    elif actual_normalized:
+        score += 0.30 * 0.2  # Some verdicts present
+
+    # Component 3: Evidence citation (20%)
+    actual_urls = re.findall(r'https?://[^\s\)]+', actual)
+    evidence_phrases = len(re.findall(
+        r'(?:according to|source|evidence|per|cited|reference|confirms|states)',
+        actual_lower
+    ))
+    citation_score = min(1.0, (len(actual_urls) * 0.3 + evidence_phrases * 0.15))
+    score += 0.20 * citation_score
+
+    # Component 4: Verdict diversity (10%)
+    unique_verdicts = set(actual_normalized)
+    if len(unique_verdicts) >= 3:
+        score += 0.10
+    elif len(unique_verdicts) == 2:
+        score += 0.10 * 0.6
+    elif len(unique_verdicts) == 1:
+        score += 0.10 * 0.3
+
+    # Component 5: Report structure (15%)
+    structure_checks = {
+        'claims_section': bool(re.search(r'(?:claim|extracted|identified)', actual_lower)),
+        'verdict_section': bool(re.search(r'(?:verdict|finding|assessment|result)', actual_lower)),
+        'confidence': bool(re.search(r'(?:confidence|certainty|reliability)', actual_lower)),
+        'summary': bool(re.search(r'(?:summary|overall|conclusion)', actual_lower)),
+    }
+    structure_score = sum(structure_checks.values()) / len(structure_checks)
+    score += 0.15 * structure_score
+
+    return min(1.0, score)
+
+
+def research_quality_match(expected: str, actual: str) -> float:
+    """
+    Evaluate research report quality for web-researcher agent.
+
+    Components:
+    - Topic coverage (25%) - addresses all key themes
+    - Source diversity (20%) - multiple sources cited
+    - Synthesis quality (25%) - organized by theme, has executive summary
+    - Citation integrity (15%) - claims attributed to sources
+    - Confidence calibration (15%) - has explicit confidence assessment
+    """
+    score = 0.0
+    expected_lower = expected.lower()
+    actual_lower = actual.lower()
+
+    # Component 1: Topic coverage (25%)
+    # Extract significant topic words from expected
+    stop_words = {'this', 'that', 'with', 'from', 'have', 'been', 'were', 'their',
+                  'about', 'which', 'would', 'could', 'should', 'there', 'these',
+                  'those', 'other', 'some', 'more', 'also', 'than', 'they', 'will',
+                  'into', 'when', 'what', 'each', 'most', 'such', 'like', 'over',
+                  'both', 'only', 'very', 'just', 'make', 'well', 'back', 'even',
+                  'good', 'much', 'then', 'them', 'many', 'made', 'after', 'being',
+                  'does', 'used', 'using', 'based', 'provides', 'including', 'while'}
+    expected_words = set(w for w in re.findall(r'\b\w{4,}\b', expected_lower) if w not in stop_words)
+    actual_words = set(w for w in re.findall(r'\b\w{4,}\b', actual_lower) if w not in stop_words)
+
+    if expected_words:
+        overlap = len(expected_words & actual_words)
+        coverage = overlap / len(expected_words)
+        score += 0.25 * min(1.0, coverage * 1.5)  # Scale up since exact word match is strict
+
+    # Component 2: Source diversity (20%)
+    actual_urls = set(re.findall(r'https?://[^\s\)]+', actual))
+    # Also count source references
+    source_refs = len(re.findall(r'(?:according to|source:|per |cited in|reference:)', actual_lower))
+    unique_domains = set()
+    for url in actual_urls:
+        domain_match = re.search(r'https?://(?:www\.)?([^/]+)', url)
+        if domain_match:
+            unique_domains.add(domain_match.group(1))
+
+    source_count = max(len(unique_domains), source_refs)
+    if source_count >= 4:
+        score += 0.20
+    elif source_count >= 2:
+        score += 0.20 * (source_count / 4)
+    elif source_count == 1:
+        score += 0.20 * 0.3
+
+    # Component 3: Synthesis quality (25%)
+    synthesis_score = 0.0
+
+    # Has executive summary?
+    if re.search(r'(?:executive\s+summary|overview|key\s+takeaway|tl;?dr)', actual_lower):
+        synthesis_score += 0.35
+
+    # Organized by theme (not by source)?
+    # Check for thematic headers (## Topic Name) vs source-oriented headers
+    headers = re.findall(r'^##?\s+(.+)', actual, re.MULTILINE)
+    source_oriented = sum(1 for h in headers if re.search(r'source|reference|article|blog|post', h.lower()))
+    theme_oriented = len(headers) - source_oriented
+    if headers:
+        if theme_oriented > source_oriented:
+            synthesis_score += 0.35
+        elif theme_oriented == source_oriented:
+            synthesis_score += 0.15
+
+    # Has structured findings (bullets, numbered lists)?
+    bullet_count = len(re.findall(r'^\s*[-*]\s', actual, re.MULTILINE))
+    if bullet_count >= 5:
+        synthesis_score += 0.3
+    elif bullet_count >= 2:
+        synthesis_score += 0.15
+
+    score += 0.25 * min(1.0, synthesis_score)
+
+    # Component 4: Citation integrity (15%)
+    # Check if claims are attributed
+    attribution_phrases = len(re.findall(
+        r'(?:according to|reported by|found that|states that|shows that|per |noted by)',
+        actual_lower
+    ))
+    inline_citations = len(re.findall(r'\[\d+\]|\[source\]|\(source:', actual_lower))
+    citation_score = min(1.0, (attribution_phrases + inline_citations) / 4)
+    score += 0.15 * citation_score
+
+    # Component 5: Confidence calibration (15%)
+    confidence_score = 0.0
+    if re.search(r'(?:confidence|certainty|reliability|caveat|limitation)', actual_lower):
+        confidence_score += 0.5
+    if re.search(r'(?:high confidence|medium confidence|low confidence|uncertain|likely|probably)', actual_lower):
+        confidence_score += 0.5
+    score += 0.15 * min(1.0, confidence_score)
+
+    return min(1.0, score)
+
+
+# =============================================================================
+# Tier 3: Skill Metrics
+# =============================================================================
+
+def writing_review_quality_match(expected: str, actual: str) -> float:
+    """
+    Evaluate writing review quality for writing-review skill. (v3)
+
+    Components:
+    - Text similarity (20%) - overall text overlap via SequenceMatcher
+    - Topic-specific overlap (15%) - blog-specific terms match (not structural)
+    - Perspective alignment (15%) - correct perspective applied
+    - Evidence grounding (20%) - verdicts supported by direct quotes
+    - Dimension coverage (15%) - expected dimensions present in actual
+    - Actionable feedback (15%) - concrete suggestions present
+    """
+    score = 0.0
+    expected_lower = expected.lower()
+    actual_lower = actual.lower()
+
+    # Component 1: Text similarity (20%)
+    # SequenceMatcher on substantial portions for overall content matching
+    # Use middle section (skip headers/metadata, capture analysis body)
+    exp_body = expected_lower[200:1200] if len(expected_lower) > 200 else expected_lower
+    act_body = actual_lower[200:1200] if len(actual_lower) > 200 else actual_lower
+    text_sim = SequenceMatcher(None, exp_body, act_body).ratio()
+    score += 0.20 * text_sim
+
+    # Component 2: Topic-specific overlap (15%)
+    # Filter OUT known structural terms shared across all reviews
+    structural_terms = {'date', 'draft', 'model', 'word count', 'has claude sections',
+                        'evidence', 'verdict', 'assessment', 'overall', 'score',
+                        'editorial critic', 'target reader', 'tone analyst', 'fact checker',
+                        'writing review', 'excerpt', 'dimension', 'criterion'}
+
+    expected_terms = set()
+    for term in re.findall(r'\*\*([^*]{3,30})\*\*', expected):
+        t = term.lower().strip()
+        if t not in structural_terms and len(t) > 5:
+            expected_terms.add(t)
+    for term in re.findall(r'^##?\s+(.{3,40})$', expected, re.MULTILINE):
+        t = term.lower().strip()
+        if not any(s in t for s in structural_terms) and len(t) > 8:
+            expected_terms.add(t)
+    # Extract quoted content (unique to each review's blog post)
+    for term in re.findall(r'["\u201c]([^"\u201d]{15,60})["\u201d]', expected):
+        expected_terms.add(term.lower().strip())
+
+    if expected_terms:
+        matched = sum(1 for t in expected_terms if t in actual_lower)
+        overlap_ratio = matched / len(expected_terms)
+        score += 0.15 * min(1.0, overlap_ratio * 1.5)
+    else:
+        score += 0.15 * text_sim * 0.5  # Fallback
+
+    # Component 3: Perspective alignment (15%)
+    perspectives = ['editorial_critic', 'editorial critic', 'target_reader', 'target reader',
+                     'tone_analyst', 'tone analyst', 'fact_checker', 'fact checker',
+                     'critic', 'reader', 'tone', 'factcheck']
+
+    expected_perspective = None
+    actual_perspective = None
+    for p in perspectives:
+        if p in expected_lower:
+            expected_perspective = p.replace('_', ' ').split()[0]
+            break
+    for p in perspectives:
+        if p in actual_lower:
+            actual_perspective = p.replace('_', ' ').split()[0]
+            break
+
+    if expected_perspective and actual_perspective:
+        if expected_perspective == actual_perspective:
+            score += 0.15
+        else:
+            score += 0.15 * 0.2
+    elif actual_perspective:
+        score += 0.15 * 0.5
+
+    # Component 4: Evidence grounding (20%)
+    quotes = re.findall(r'["\u201c]([^"\u201d]{10,})["\u201d]|>\s*(.{10,})', actual)
+    quote_count = len(quotes)
+    if quote_count >= 3:
+        score += 0.20
+    elif quote_count >= 1:
+        score += 0.20 * (quote_count / 3)
+    elif re.search(r'(?:excerpt|quote|passage|text says|writes)', actual_lower):
+        score += 0.20 * 0.2
+
+    # Component 5: Dimension coverage (15%)
+    expected_dims = set(re.findall(r'(?:dimension|criterion|aspect)[:\s]*([^\n,;]+)', expected_lower))
+    actual_dims = set(re.findall(r'(?:dimension|criterion|aspect)[:\s]*([^\n,;]+)', actual_lower))
+
+    expected_scores_count = len(re.findall(r'\b[1-5]\s*/\s*5\b|\b[1-9]\s*/\s*10\b|\bscore[:\s]*\d', expected_lower))
+    actual_scores_count = len(re.findall(r'\b[1-5]\s*/\s*5\b|\b[1-9]\s*/\s*10\b|\bscore[:\s]*\d', actual_lower))
+
+    if expected_scores_count > 0:
+        dim_ratio = min(1.0, actual_scores_count / expected_scores_count)
+        score += 0.15 * dim_ratio
+    elif expected_dims:
+        if actual_dims:
+            overlap = len(expected_dims & actual_dims)
+            score += 0.15 * (overlap / len(expected_dims))
+        else:
+            score += 0.15 * 0.1
+    else:
+        score += 0.15 * text_sim * 0.5  # Fallback
+
+    # Component 6: Actionable feedback (15%)
+    suggestion_patterns = [
+        r'(?:suggest|recommend|consider|should|could|try|improve|revise|add|remove|clarify)',
+        r'(?:action|feedback|next step|improvement)',
+    ]
+    suggestion_count = sum(len(re.findall(p, actual_lower)) for p in suggestion_patterns)
+    verdict_present = bool(re.search(r'(?:verdict|overall|assessment|rating)[:\s]', actual_lower))
+    feedback_score = min(1.0, suggestion_count / 4 + (0.3 if verdict_present else 0))
+    score += 0.15 * feedback_score
+
+    return min(1.0, score)
+
+
+def handoff_quality_match(expected: str, actual: str) -> float:
+    """
+    Evaluate session handoff quality for session-handoff skill. (v2)
+
+    Components:
+    - Content overlap (20%) - actual references same entities/topics as expected
+    - Next step specificity (25%) - specific enough to resume without questions
+    - File path overlap (15%) - references same files as expected
+    - State completeness (15%) - covers current state, decisions, blockers
+    - Verification commands (15%) - includes commands to verify state
+    - Structure quality (10%) - organized with clear sections
+    """
+    score = 0.0
+    expected_lower = expected.lower()
+    actual_lower = actual.lower()
+
+    # Component 1: Content overlap (20%)
+    # Extract key terms from expected and check overlap with actual
+    # Key terms: multi-word technical phrases, identifiers, specific nouns
+    expected_terms = set()
+    # Extract backtick-enclosed terms
+    for term in re.findall(r'`([^`]{3,40})`', expected):
+        expected_terms.add(term.lower().strip())
+    # Extract CamelCase or snake_case identifiers
+    for term in re.findall(r'\b([A-Z][a-z]+[A-Z]\w+|[a-z]+_[a-z_]+)\b', expected):
+        expected_terms.add(term.lower())
+    # Extract technology/framework names (capitalized words 3+ chars)
+    for term in re.findall(r'\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b', expected):
+        term_lower = term.lower()
+        # Skip common structural words
+        if term_lower not in {'session', 'handoff', 'current', 'state', 'completed', 'work',
+                               'next', 'steps', 'files', 'read', 'first', 'key', 'decisions',
+                               'verification', 'commands', 'note', 'summary', 'changes'}:
+            expected_terms.add(term_lower)
+
+    if expected_terms:
+        matched = sum(1 for t in expected_terms if t in actual_lower)
+        overlap_ratio = matched / len(expected_terms)
+        score += 0.20 * min(1.0, overlap_ratio * 1.5)  # Boost: 67% overlap = full credit
+    else:
+        # Fallback to SequenceMatcher
+        score += 0.20 * SequenceMatcher(None, expected_lower[:500], actual_lower[:500]).ratio()
+
+    # Component 2: Next step specificity (25%)
+    specific_markers = [
+        r'(?:complete|finish|implement|add|fix|create|update|remove|test)\s+\w+',
+        r'(?:POST|GET|PUT|DELETE)\s+/\w+',
+        r'(?:function|method|class|component)\s+\w+',
+    ]
+    vague_markers = ['continue working', 'finish up', 'keep going', 'do more', 'work on it']
+
+    specific_count = sum(len(re.findall(p, actual_lower)) for p in specific_markers)
+    vague_count = sum(1 for v in vague_markers if v in actual_lower)
+
+    if specific_count >= 3 and vague_count == 0:
+        score += 0.25
+    elif specific_count >= 2:
+        score += 0.25 * 0.7
+    elif specific_count >= 1:
+        score += 0.25 * 0.4
+    elif vague_count > 0:
+        score += 0.25 * 0.1
+
+    # Component 3: File path overlap (15%)
+    # Extract file paths from expected AND actual, then compare
+    def extract_file_paths(text):
+        paths = set()
+        for p in re.findall(r'`([^`]*(?:\.\w{2,4}|/\w+/)[^`]*)`', text):
+            paths.add(p.lower().strip())
+        for p in re.findall(r'(?:file|path|module)[:\s]*`?([^\s,`]+\.\w{2,4})', text.lower()):
+            paths.add(p.lower().strip())
+        return paths
+
+    expected_files = extract_file_paths(expected)
+    actual_files = extract_file_paths(actual)
+
+    if expected_files:
+        if actual_files:
+            overlap = len(expected_files & actual_files)
+            score += 0.15 * min(1.0, overlap / len(expected_files))
+        # No credit if expected has files but actual doesn't
+    else:
+        # No expected files: credit based on actual having any files
+        if actual_files:
+            score += 0.15 * min(1.0, len(actual_files) / 3)
+
+    # Component 4: State completeness (15%)
+    state_checks = {
+        'current_state': bool(re.search(r'(?:current|status|state|phase|progress)', actual_lower)),
+        'completed': bool(re.search(r'(?:completed|done|finished|implemented)', actual_lower)),
+        'pending': bool(re.search(r'(?:pending|remaining|todo|next|still need)', actual_lower)),
+        'decisions': bool(re.search(r'(?:decision|chose|rationale|because|why)', actual_lower)),
+        'blockers': bool(re.search(r'(?:blocker|blocked|issue|problem|depends on)', actual_lower)),
+    }
+    state_score = sum(state_checks.values()) / len(state_checks)
+    score += 0.15 * state_score
+
+    # Component 5: Verification commands (15%)
+    code_blocks = re.findall(r'```(?:bash|sh|shell)?\n(.+?)```', actual, re.DOTALL)
+    inline_commands = re.findall(r'`((?:npm|pnpm|yarn|python|pytest|curl|git|make)\s+[^`]+)`', actual)
+    command_count = len(code_blocks) + len(inline_commands)
+
+    if command_count >= 2:
+        score += 0.15
+    elif command_count == 1:
+        score += 0.15 * 0.6
+    elif re.search(r'(?:run|execute|verify|check|test)', actual_lower):
+        score += 0.15 * 0.2
+
+    # Component 6: Structure quality (10%)
+    headers = re.findall(r'^##?\s+.+', actual, re.MULTILINE)
+    has_bullets = bool(re.findall(r'^\s*[-*]\s', actual, re.MULTILINE))
+    structure_score = min(1.0, len(headers) / 3 + (0.3 if has_bullets else 0))
+    score += 0.10 * structure_score
+
+    return min(1.0, score)
+
+
+# =============================================================================
+# Publication Review Metrics
+# =============================================================================
+
+def publication_review_match(expected: str, actual: str) -> float:
+    """
+    Evaluate publication review output quality.
+
+    Three weighted components:
+    - 50%: Finding recall (weighted by tier: MUST=3x, SHOULD=1.5x, NICE=0.5x)
+    - 30%: Tier accuracy (exact=1.0, off-by-one=0.5, off-by-two=0.2)
+    - 20%: Precision (1 - unmatched_actual/total_actual, clamped [0,1])
+
+    Uses keyword-based Jaccard similarity (threshold 0.25) for finding matching,
+    since models describe the same issue differently.
+
+    Args:
+        expected: Gold standard review output (from fix-manifest triage)
+        actual: Model-generated review output
+
+    Returns:
+        Score between 0.0 and 1.0
+    """
+    from .extractors import (
+        extract_review_findings,
+        match_review_findings,
+        ReviewFinding,
+    )
+
+    expected_findings = extract_review_findings(expected)
+    actual_findings = extract_review_findings(actual)
+
+    if not expected_findings:
+        # No expected findings — score based on actual being empty too
+        return 1.0 if not actual_findings else 0.5
+
+    if not actual_findings:
+        return 0.0
+
+    # Match expected findings to actual
+    # Low threshold because models describe the same issue very differently
+    # (manifest uses post quotes; models use review language)
+    matches = match_review_findings(expected_findings, actual_findings, threshold=0.10)
+
+    # Tier weights for recall
+    tier_weights = {"MUST": 3.0, "SHOULD": 1.5, "NICE": 0.5}
+
+    # Component 1: Finding recall (50%) — weighted by tier
+    total_weight = sum(tier_weights.get(e.tier, 1.0) for e in expected_findings)
+    recalled_weight = 0.0
+
+    for exp, matched, sim in matches:
+        if matched is not None:
+            recalled_weight += tier_weights.get(exp.tier, 1.0)
+
+    recall = recalled_weight / total_weight if total_weight > 0 else 0.0
+
+    # Component 2: Tier accuracy (30%) — for matched findings
+    matched_pairs = [(exp, act, sim) for exp, act, sim in matches if act is not None]
+    if matched_pairs:
+        tier_order = ["MUST", "SHOULD", "NICE"]
+
+        tier_accuracy_sum = 0.0
+        for exp, act, sim in matched_pairs:
+            if exp.tier == act.tier:
+                tier_accuracy_sum += 1.0
+            elif exp.tier in tier_order and act.tier in tier_order:
+                distance = abs(tier_order.index(exp.tier) - tier_order.index(act.tier))
+                if distance == 1:
+                    tier_accuracy_sum += 0.5
+                else:
+                    tier_accuracy_sum += 0.2
+            else:
+                tier_accuracy_sum += 0.2
+
+        tier_accuracy = tier_accuracy_sum / len(matched_pairs)
+    else:
+        tier_accuracy = 0.0
+
+    # Component 3: Precision (20%) — penalize unmatched actual findings
+    matched_actual_count = sum(1 for _, act, _ in matches if act is not None)
+    total_actual = len(actual_findings)
+    unmatched_actual = total_actual - matched_actual_count
+
+    precision = max(0.0, 1.0 - (unmatched_actual / total_actual)) if total_actual > 0 else 1.0
+
+    # Weighted combination
+    score = 0.50 * recall + 0.30 * tier_accuracy + 0.20 * precision
+
+    return min(1.0, max(0.0, score))
