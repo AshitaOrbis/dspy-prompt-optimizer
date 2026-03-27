@@ -147,9 +147,11 @@ class GeminiModelRunner(ModelRunner):
 
     def __init__(
         self,
-        model: str = "gemini-3.1-pro-preview",
+        model: Optional[str] = None,
         timeout: int = 480,
     ):
+        # Default None = use gemini CLI's built-in default (avoids capacity
+        # issues with explicitly requesting gemini-3.1-pro-preview)
         self.model = model
         self.timeout = timeout
         self._binary = self._find_gemini_binary()
@@ -184,9 +186,10 @@ class GeminiModelRunner(ModelRunner):
         cmd = [
             self._binary,
             "-p", "Review the following document:",
-            "-m", self.model,
             "--yolo",
         ]
+        if self.model:
+            cmd.extend(["-m", self.model])
 
         env = {k: v for k, v in os.environ.items()}
 
