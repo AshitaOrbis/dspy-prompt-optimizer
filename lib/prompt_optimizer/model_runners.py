@@ -290,11 +290,22 @@ def get_runner_for_model(model: str) -> ModelRunner:
     """
     Factory function to get the appropriate runner for a target model.
 
+    Aliases vs pinned IDs:
+
+    - ``"opus"`` uses the CLI alias — drifts with Anthropic releases. Pick this
+      when you want the experiment to track whatever the current Opus generation
+      is (normal optimization runs).
+    - ``"opus-4-7"`` pins the exact model ID. Pick this for longitudinal
+      studies where reproducibility across future model releases matters
+      (e.g., baselines you'll re-run in six months to compare deltas).
+
+    The same pattern is used in the Psyche benchmark (`benchmark/run_eval.py`).
+
     Args:
-        model: One of "gpt", "gemini", "opus"
+        model: One of "gpt", "gemini", "opus" (alias), or "opus-4-7" (pinned).
 
     Returns:
-        Appropriate ModelRunner instance
+        Appropriate ModelRunner instance.
     """
     from .claude_runner import ClaudeRunner
 
@@ -304,5 +315,12 @@ def get_runner_for_model(model: str) -> ModelRunner:
         return GeminiModelRunner()
     elif model == "opus":
         return ClaudeRunner(model="opus", timeout=480)
+    elif model == "opus-4-7":
+        # Pinned Opus 4.7 for longitudinal comparison. The CLI accepts full
+        # model IDs as well as aliases.
+        return ClaudeRunner(model="claude-opus-4-7", timeout=480)
     else:
-        raise ValueError(f"Unknown model: {model}. Expected 'gpt', 'gemini', or 'opus'")
+        raise ValueError(
+            f"Unknown model: {model}. "
+            f"Expected 'gpt', 'gemini', 'opus', or 'opus-4-7'."
+        )

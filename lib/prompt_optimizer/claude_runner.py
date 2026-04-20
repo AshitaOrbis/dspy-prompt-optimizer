@@ -292,7 +292,12 @@ class ClaudeRunner:
         Useful for tiered optimization (Haiku -> Sonnet -> Opus).
 
         Args:
-            model: New model to use (sonnet, opus, haiku)
+            model: New model to use. Accepts either a CLI alias ("haiku",
+                "sonnet", "opus") which tracks the current generation, or
+                a pinned full model ID ("claude-opus-4-7", "claude-opus-4-6",
+                etc.) for longitudinal studies where a specific generation
+                is load-bearing. The ``claude -p --model`` flag accepts
+                both forms, so the string is passed through as-is.
 
         Returns:
             New ClaudeRunner instance with the specified model
