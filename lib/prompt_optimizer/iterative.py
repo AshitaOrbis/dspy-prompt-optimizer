@@ -452,6 +452,13 @@ class IterativeOptimizer:
             storage=self.storage,
         )
 
+        # Pass through demo_transformer and format_instruction if available
+        extra_kwargs = {}
+        if hasattr(self, 'demo_transformer') and self.demo_transformer:
+            extra_kwargs['demo_transformer'] = self.demo_transformer
+        if hasattr(self, 'format_instruction') and self.format_instruction:
+            extra_kwargs['format_instruction'] = self.format_instruction
+
         result = bootstrap.optimize(
             base_prompt=prompt,
             training_data=data,
@@ -459,6 +466,7 @@ class IterativeOptimizer:
             threshold=threshold,
             agent_name=f"{agent_name}_round_{round_num}",
             verbose=verbose,
+            **extra_kwargs,
         )
 
         return result, result.avg_score

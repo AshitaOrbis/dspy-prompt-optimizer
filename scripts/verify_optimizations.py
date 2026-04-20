@@ -409,6 +409,11 @@ def main():
         if verbose:
             print(f"Found {len(targets)} targets with holdout data")
 
+        # Build data basename mapping (agent/skill name -> dataset basename)
+        all_data_basenames = {}
+        all_data_basenames.update(AGENT_DATA_PATHS)
+        all_data_basenames.update(SKILL_DATA_PATHS)
+
         # Run full verification
         report = suite.run_full_verification(
             agent_names=targets,
@@ -420,6 +425,7 @@ def main():
             run_cross_validation=args.cross_validate,
             k_folds=args.k,
             verbose=verbose,
+            data_basenames=all_data_basenames,
         )
 
         # Generate and save report

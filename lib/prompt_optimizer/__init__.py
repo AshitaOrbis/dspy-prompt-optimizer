@@ -88,6 +88,7 @@ from .verification import (
     RegressionResult,
     VerificationReport,
     generate_verification_report,
+    pre_flight_holdout_check,
 )
 from .utils import (
     parse_markdown_prompt,

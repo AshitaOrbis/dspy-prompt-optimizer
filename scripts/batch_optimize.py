@@ -48,6 +48,8 @@ from prompt_optimizer import (
     # Tier 1 agent metrics
     pr_quality_match,
     refactoring_match,
+    implementation_completeness,
+    root_cause_match,
     # Tier 2 agent metrics
     discovery_quality_match,
     fact_check_quality_match,
@@ -78,6 +80,8 @@ from prompt_optimizer.batch import (
     optimize_batch_parallel,
     generate_batch_report,
 )
+from prompt_optimizer.verification import pre_flight_holdout_check
+from prompt_optimizer.bootstrap import TrainingExample as HoldoutExample
 
 
 # Default metric mappings
@@ -90,6 +94,8 @@ AGENT_METRICS = {
     # Tier 1
     "pr-preparer": pr_quality_match,
     "refactoring-advisor": refactoring_match,
+    "feature-implementer": implementation_completeness,
+    "debugger": root_cause_match,
     # Tier 2
     "capability-discoverer": discovery_quality_match,
     "fact-checker": fact_check_quality_match,
@@ -120,6 +126,8 @@ AGENT_DATA_PATHS = {
     # Tier 1
     "pr-preparer": "pr-preparations.jsonl",
     "refactoring-advisor": "refactoring-decisions.jsonl",
+    "feature-implementer": "feature-implementations.jsonl",
+    "debugger": "debugging-sessions.jsonl",
     # Tier 2
     "capability-discoverer": "discoveries.jsonl",
     "fact-checker": "fact-checks.jsonl",
@@ -377,6 +385,18 @@ def main():
         action="store_true",
         help="Disable demo transformers and format instructions",
     )
+    parser.add_argument(
+        "--holdout-gate",
+        action="store_true",
+        help="Run pre-flight holdout check before saving _latest.json. "
+             "Prevents regression by comparing new optimization against existing.",
+    )
+    parser.add_argument(
+        "--holdout-dir",
+        type=str,
+        default="datasets",
+        help="Directory containing holdout files (default: datasets, used with --holdout-gate)",
+    )
 
     args = parser.parse_args()
 
@@ -459,6 +479,18 @@ def main():
     # Setup
     runner = ClaudeRunner(model=model, timeout=args.timeout)
     storage = DemoStorage()
+
+    # Backup existing _latest.json files if holdout gate is enabled
+    if args.holdout_gate:
+        import shutil as gate_shutil
+        prompts_dir = storage.prompts_dir
+        for target in targets:
+            latest_path = prompts_dir / f"{target.name}_latest.json"
+            backup_path = prompts_dir / f"{target.name}_latest.json.pre-gate"
+            if latest_path.exists():
+                gate_shutil.copy2(latest_path, backup_path)
+                if verbose:
+                    print(f"  Backed up {target.name}_latest.json for holdout gate")
 
     # Tiered optimization: Haiku -> Sonnet -> Opus
     if args.tier == "tiered":
@@ -608,6 +640,129 @@ def main():
                 storage=storage,
                 verbose=verbose,
             )
+
+    # Pre-flight holdout gate (if enabled)
+    # Strategy: backup _latest.json before optimization, restore if gate fails.
+    # Since optimization already ran and overwrote _latest.json, we compare the
+    # new _latest.json against the backed-up version on holdout data.
+    if args.holdout_gate:
+        import json as gate_json
+        import shutil
+        holdout_dir = Path(args.holdout_dir)
+        all_metrics = {**AGENT_METRICS, **SKILL_METRICS}
+        prompts_dir = storage.prompts_dir
+
+        if verbose:
+            print("\n" + "=" * 50)
+            print("PRE-FLIGHT HOLDOUT GATE")
+            print("=" * 50)
+
+        for target in targets:
+            # Find holdout file
+            data_basename = AGENT_DATA_PATHS.get(target.name) or SKILL_DATA_PATHS.get(target.name) or target.name
+            data_basename = data_basename.replace(".jsonl", "")
+            holdout_path = holdout_dir / f"{data_basename}-holdout.jsonl"
+
+            if not holdout_path.exists():
+                if verbose:
+                    print(f"\n  {target.name}: No holdout file, skipping gate")
+                continue
+
+            metric_fn = all_metrics.get(target.name)
+            if not metric_fn:
+                if verbose:
+                    print(f"\n  {target.name}: No metric function, skipping gate")
+                continue
+
+            # Load holdout data
+            holdout_data = []
+            with open(holdout_path) as f:
+                for line in f:
+                    if line.strip():
+                        data = gate_json.loads(line)
+                        holdout_data.append(HoldoutExample(
+                            input_text=data["input"],
+                            expected_output=data["expected"],
+                            metadata=data.get("metadata"),
+                        ))
+
+            # Check if there's a backup from before this run
+            latest_path = prompts_dir / f"{target.name}_latest.json"
+            backup_path = prompts_dir / f"{target.name}_latest.json.pre-gate"
+
+            # Load the current (newly optimized) prompt
+            new_optimized = storage.load_optimized_prompt(target.name)
+            if not new_optimized:
+                if verbose:
+                    print(f"\n  {target.name}: No optimization found, skipping gate")
+                continue
+
+            # Evaluate new optimization on holdout
+            new_prompt = new_optimized.to_prompt()
+            new_scores = []
+            for i, ex in enumerate(holdout_data):
+                full_prompt = f"{new_prompt}\n\n## New Input\n\n{ex.input_text}"
+                result = runner.run(full_prompt)
+                if result.success:
+                    score = metric_fn(ex.expected_output, result.output)
+                    new_scores.append(score)
+                    if verbose:
+                        print(f"  [{target.name} holdout {i+1}/{len(holdout_data)}] {score:.3f}")
+
+            new_avg = sum(new_scores) / len(new_scores) if new_scores else 0.0
+
+            if verbose:
+                print(f"\n  {target.name}: New holdout avg = {new_avg:.3f}")
+
+            if backup_path.exists():
+                # Evaluate the BACKUP (previous _latest.json) on the SAME
+                # holdout data to get an apples-to-apples holdout comparison.
+                # (Previous versions compared new holdout vs old training
+                # avg_score — wrong scale, wrong metric.)
+                from prompt_optimizer.storage import DemoStorage, OptimizedPrompt, Demo
+                with open(backup_path) as bf:
+                    backup_data = gate_json.load(bf)
+                old_demos = [Demo(**d) for d in backup_data.get("demos", [])]
+                old_optimized = OptimizedPrompt(
+                    base_prompt=backup_data["base_prompt"],
+                    demos=old_demos,
+                    optimization_date=backup_data["optimization_date"],
+                    metric_name=backup_data["metric_name"],
+                    threshold=backup_data["threshold"],
+                    avg_score=backup_data["avg_score"],
+                    metadata=backup_data.get("metadata"),
+                    format_instruction=backup_data.get("format_instruction", ""),
+                )
+                old_prompt = old_optimized.to_prompt()
+                old_scores = []
+                for i, ex in enumerate(holdout_data):
+                    full_prompt = f"{old_prompt}\n\n## New Input\n\n{ex.input_text}"
+                    result = runner.run(full_prompt)
+                    if result.success:
+                        score = metric_fn(ex.expected_output, result.output)
+                        old_scores.append(score)
+                        if verbose:
+                            print(f"  [{target.name} backup holdout {i+1}/{len(holdout_data)}] {score:.3f}")
+
+                old_avg = sum(old_scores) / len(old_scores) if old_scores else 0.0
+
+                if verbose:
+                    print(f"  {target.name}: Previous holdout avg = {old_avg:.3f}")
+
+                if new_avg < old_avg - 0.02:
+                    if verbose:
+                        print(f"  GATE FAILED: Regression ({new_avg:.3f} < {old_avg:.3f} - 0.02)")
+                        print(f"  Restoring previous _latest.json from backup")
+                    shutil.copy2(backup_path, latest_path)
+                    # Keep backup for auditing; caller can clean up if desired
+                else:
+                    if verbose:
+                        print(f"  GATE PASSED: {new_avg:.3f} >= {old_avg:.3f} - 0.02")
+                    # Clean up backup on pass
+                    backup_path.unlink(missing_ok=True)
+            else:
+                if verbose:
+                    print(f"  No previous optimization (first run). Gate: auto-pass.")
 
     # Generate report
     if args.report:

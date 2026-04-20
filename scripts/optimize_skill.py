@@ -42,6 +42,9 @@ from prompt_optimizer import (
     tool_tier_classification,
     # Plan quality metric
     plan_quality_match,
+    # Tier 3 skill metrics
+    writing_review_quality_match,
+    handoff_quality_match,
 )
 from prompt_optimizer.bootstrap import TrainingExample
 from prompt_optimizer.storage import OptimizedPrompt
@@ -55,6 +58,8 @@ SKILL_METRICS = {
     "binary_decision": binary_decision_match,
     "tool_tier": tool_tier_classification,
     "plan_quality": plan_quality_match,
+    "writing_review_quality": writing_review_quality_match,
+    "handoff_quality": handoff_quality_match,
     "exact_match": exact_match,
     "score_similarity": score_similarity,
 }
@@ -66,6 +71,8 @@ SKILL_DEFAULT_METRICS = {
     "advanced-tool-use": "tool_tier",
     "dispatching-parallel-agents": "binary_decision",
     "plan-mode-quality": "plan_quality",
+    "writing-review": "writing_review_quality",
+    "session-handoff": "handoff_quality",
 }
 
 

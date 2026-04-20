@@ -67,6 +67,25 @@ class CodexModelRunner(ModelRunner):
 
         return "codex"
 
+    @staticmethod
+    def _get_configured_mcp_servers() -> list:
+        """Read config.toml and return names of defined MCP servers."""
+        config_path = os.path.expanduser("~/.codex/config.toml")
+        if not os.path.isfile(config_path):
+            return []
+        servers = []
+        try:
+            with open(config_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("[mcp_servers.") and line.endswith("]"):
+                        name = line[len("[mcp_servers."):-1]
+                        if name and "." not in name:
+                            servers.append(name)
+        except OSError:
+            pass
+        return servers
+
     def run(self, prompt: str, context: Optional[str] = None) -> RunResult:
         """Run prompt through Codex CLI via stdin."""
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
@@ -76,18 +95,22 @@ class CodexModelRunner(ModelRunner):
         # Disable all MCP servers to avoid startup overhead and token waste.
         # Without MCP: ~1.7K tokens, instant startup.
         # With MCP: ~11.5K tokens, ~10s startup per call.
+        # Build command. Disable MCP servers that exist in config.toml to avoid
+        # startup overhead and token waste (~10K tokens saved per call).
+        # Only disable servers that are actually defined — Codex rejects
+        # config overrides for non-existent servers.
         cmd = [
             self._binary,
             "exec",
             "--full-auto",
             "-c", f'model="{self.model}"',
-            "-c", "mcp_servers.brave-search.enabled=false",
-            "-c", "mcp_servers.exa.enabled=false",
-            "-c", "mcp_servers.filesystem.enabled=false",
-            "-c", "mcp_servers.memory.enabled=false",
+        ]
+        for server_name in self._get_configured_mcp_servers():
+            cmd.extend(["-c", f"mcp_servers.{server_name}.enabled=false"])
+        cmd.extend([
             "--ephemeral",  # Don't persist session files
             "-",  # Read prompt from stdin
-        ]
+        ])
 
         env = {k: v for k, v in os.environ.items()}
 
@@ -233,10 +256,34 @@ class GeminiModelRunner(ModelRunner):
 
     @staticmethod
     def _clean_output(output: str) -> str:
-        """Remove ANSI codes and clean up."""
+        """Remove ANSI codes and strip Gemini CLI preamble lines.
+
+        Gemini CLI emits headers like "YOLO mode is enabled..." and
+        "Loaded cached credentials." to stdout before the actual model
+        output. These contaminate parsed responses, so strip any
+        preamble lines that match known patterns.
+        """
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         cleaned = ansi_escape.sub('', output)
-        return cleaned.strip()
+
+        preamble_patterns = (
+            "YOLO mode",
+            "Loaded cached credentials",
+            "Data collection is disabled",
+            "Using model:",
+        )
+        lines = cleaned.splitlines()
+        start = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(stripped.startswith(p) for p in preamble_patterns):
+                start = i + 1
+                continue
+            start = i
+            break
+        return "\n".join(lines[start:]).strip()
 
 
 def get_runner_for_model(model: str) -> ModelRunner:

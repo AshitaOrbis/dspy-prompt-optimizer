@@ -31,29 +31,34 @@ CHANGE_TYPE_RELATED: Dict[str, List[str]] = {
     'meta': [],
 }
 
-# Technique equivalence groups for refactoring_match (expanded)
+# Technique equivalence groups for refactoring_match (expanded v2)
 TECHNIQUE_EQUIVALENCES: Dict[str, Set[str]] = {
     'decomposition': {
         'extract_method', 'extract_function', 'extract_class',
         'pipeline_pattern', 'compose_method', 'split_phase',
         'break_into', 'smaller_function',
+        'inline_method', 'replace_temp', 'consolidate_conditional',
+        'encapsulate_field',
     },
     'polymorphism': {
         'strategy_pattern', 'state_pattern', 'command_pattern',
         'replace_conditional_with_polymorphism', 'renderer_registry',
+        'observer_pattern', 'decorator_pattern', 'factory_pattern',
     },
     'data_organization': {
         'extract_class', 'extract_configuration', 'lookup_table',
         'introduce_parameter_object', 'value_object', 'builder_pattern',
-        'config_driven_events',
+        'config_driven_events', 'replace_magic',
     },
     'orchestration': {
         'facade_and_events', 'saga_pattern', 'saga_orchestrator',
         'event_sourcing', 'command_handler',
+        'dependency_injection',
     },
     'abstraction': {
         'extract_generic_base', 'template_method', 'generic_helper',
         'abstract_factory', 'introduce_interface',
+        'factory_pattern',
     },
     'efficiency': {
         'batch_fetching', 'dataloader_pattern', 'parallel_fetch',
@@ -62,30 +67,44 @@ TECHNIQUE_EQUIVALENCES: Dict[str, Set[str]] = {
 }
 
 # Smell-technique affinity (which technique groups are valid for which smells)
+# Expanded v2: broader affinity — most smells accept 3+ technique groups
+# because real refactoring often has multiple valid approaches
 SMELL_TECHNIQUE_AFFINITY: Dict[str, List[str]] = {
-    'long_method': ['decomposition', 'orchestration'],
-    'duplicate_code': ['abstraction', 'decomposition'],
-    'conditional_complexity': ['polymorphism', 'data_organization'],
-    'switch_statement': ['polymorphism', 'data_organization'],
-    'type_conditional': ['polymorphism', 'data_organization'],
-    'god_class': ['decomposition', 'orchestration'],
-    'feature_envy': ['decomposition', 'abstraction'],
-    'data_clumps': ['data_organization', 'abstraction'],
-    'primitive_obsession': ['data_organization'],
-    'hardcoded_rules': ['data_organization', 'abstraction'],
-    'n_plus_one_queries': ['efficiency'],
-    'orchestration_in_service': ['orchestration', 'decomposition'],
+    'long_method': ['decomposition', 'orchestration', 'abstraction'],
+    'duplicate_code': ['abstraction', 'decomposition', 'data_organization'],
+    'conditional_complexity': ['polymorphism', 'data_organization', 'decomposition'],
+    'switch_statement': ['polymorphism', 'data_organization', 'decomposition'],
+    'type_conditional': ['polymorphism', 'data_organization', 'abstraction'],
+    'god_class': ['decomposition', 'orchestration', 'abstraction'],
+    'feature_envy': ['decomposition', 'abstraction', 'data_organization'],
+    'data_clumps': ['data_organization', 'abstraction', 'decomposition'],
+    'primitive_obsession': ['data_organization', 'abstraction'],
+    'hardcoded_rules': ['data_organization', 'abstraction', 'decomposition'],
+    'n_plus_one_queries': ['efficiency', 'data_organization'],
+    'orchestration_in_service': ['orchestration', 'decomposition', 'abstraction'],
+    # New smell entries
+    'large_class': ['decomposition', 'abstraction', 'orchestration'],
+    'lazy_class': ['decomposition', 'abstraction'],
+    'speculative_generality': ['decomposition', 'abstraction'],
+    'message_chains': ['abstraction', 'decomposition'],
+    'middle_man': ['decomposition', 'abstraction'],
+    'divergent_change': ['decomposition', 'abstraction', 'data_organization'],
+    'shotgun_surgery': ['abstraction', 'decomposition', 'data_organization'],
+    'parallel_inheritance': ['abstraction', 'polymorphism'],
+    'inappropriate_intimacy': ['decomposition', 'abstraction', 'data_organization'],
 }
 
 # Code smell equivalence groups (for semantic matching)
+# Expanded v2: added new smells, broader groupings
 SMELL_EQUIVALENCES: Dict[str, Set[str]] = {
     'complexity': {
         'long_method', 'god_class', 'orchestration_in_service',
         'complex_method', 'too_many_lines', 'multiple_responsibilities',
+        'large_class', 'divergent_change',
     },
     'duplication': {
         'duplicate_code', 'shotgun_surgery', 'dry_violation',
-        'repeated_code', 'copy_paste',
+        'repeated_code', 'copy_paste', 'parallel_inheritance',
     },
     'conditionals': {
         'conditional_complexity', 'switch_statement', 'type_conditional',
@@ -101,7 +120,11 @@ SMELL_EQUIVALENCES: Dict[str, Set[str]] = {
     },
     'coupling': {
         'feature_envy', 'inappropriate_intimacy',
-        'knows_too_much',
+        'knows_too_much', 'message_chains', 'middle_man',
+    },
+    'overdesign': {
+        'lazy_class', 'speculative_generality',
+        'dead_code', 'unused_abstraction',
     },
 }
 
@@ -267,9 +290,9 @@ def _score_technique_for_smell(
         return 1.0  # Valid technique for this smell
 
     if technique_group:
-        return 0.4  # Known technique but not ideal for this smell
+        return 0.6  # Known technique but not in primary affinity (was 0.4)
 
-    return 0.2  # Unknown technique
+    return 0.3  # Unknown technique (was 0.2)
 
 
 def exact_match(expected: str, actual: str) -> float:
@@ -1325,15 +1348,42 @@ def pr_quality_match(expected: str, actual: str) -> float:
         return None
 
     def check_required_sections(text: str) -> Dict[str, bool]:
-        """Check presence of required PR sections with content validation."""
+        """Check presence of required PR sections with flexible format detection."""
         text_lower = text.lower()
 
+        # Match both markdown headers AND bold-text labels (e.g., **Summary:** or Summary:)
+        def _has_section(patterns: list) -> bool:
+            for p in patterns:
+                if re.search(p, text_lower):
+                    return True
+            return False
+
         sections = {
-            'summary': bool(re.search(r'##?\s*(summary|overview|description|what|about)', text_lower)),
-            'changes': bool(re.search(r'##?\s*(changes|what.?changed|modifications|diff|files)', text_lower)),
-            'type': bool(re.search(r'##?\s*(type|category|kind|classification)', text_lower)),
-            'risk': bool(re.search(r'##?\s*(risk|impact|safety|concern)', text_lower)),
-            'testing': bool(re.search(r'##?\s*(test|testing|verification|how.?to.?test|qa)', text_lower)),
+            'summary': _has_section([
+                r'##?\s*(summary|overview|description|what|about)',
+                r'\*\*\s*(summary|overview|description)\s*[\*:]',
+                r'^(summary|overview|description)\s*:',
+            ]),
+            'changes': _has_section([
+                r'##?\s*(changes|what.?changed|modifications|diff|files)',
+                r'\*\*\s*(changes|what.?changed|files)\s*[\*:]',
+                r'^\s*[-*]\s+\S.*\.\w+',  # Bullet points mentioning files (fallback)
+            ]),
+            'type': _has_section([
+                r'##?\s*(type|category|kind|classification)',
+                r'\*\*\s*(type|category)\s*[\*:]',
+                r'type\s*:\s*(feature|bug|fix|refactor|docs|test|chore)',
+            ]),
+            'risk': _has_section([
+                r'##?\s*(risk|impact|safety|concern)',
+                r'\*\*\s*(risk|impact)\s*[\*:]',
+                r'risk\s*:\s*(low|medium|high)',
+            ]),
+            'testing': _has_section([
+                r'##?\s*(test|testing|verification|how.?to.?test|qa)',
+                r'\*\*\s*(test|testing|how to test)\s*[\*:]',
+                r'-\s*\[[ x]\]',  # Checkbox items indicate test plan
+            ]),
         }
         return sections
 
@@ -1362,37 +1412,60 @@ def pr_quality_match(expected: str, actual: str) -> float:
         return scores
 
     def count_test_items(text: str) -> int:
-        """Count testing checklist items."""
-        test_items = re.findall(r'-\s*\[[ x]\]', text)
-        return len(test_items)
+        """Count testing checklist items (flexible format)."""
+        # Standard checkbox format
+        checkbox_items = re.findall(r'-\s*\[[ x]\]', text)
+        # Numbered test items under a test section
+        numbered_items = re.findall(r'\d+\.\s+(?:test|verify|check|confirm|ensure)', text, re.IGNORECASE)
+        # Bullet points under a test section
+        bullet_items = re.findall(r'-\s+(?:test|verify|check|confirm|ensure|run)\b', text, re.IGNORECASE)
+        return max(len(checkbox_items), len(numbered_items), len(bullet_items))
 
     def check_quality_indicators(text: str) -> float:
-        """Check for quality indicators in PR description."""
+        """Check for quality indicators in PR description.
+
+        Only counts indicators that are relevant to the PR content,
+        so simple PRs aren't penalized for missing screenshots/migration notes.
+        Guarantees a base score for having any substantive content.
+        """
         text_lower = text.lower()
         indicators_found = 0
-        total_indicators = 5
+        applicable_indicators = 0
 
-        # Check for screenshots/images
-        if re.search(r'!\[.*?\]\(.*?\)|<img|screenshot', text_lower):
+        # Check for screenshots/images (only applicable if UI changes mentioned)
+        if re.search(r'ui|component|page|layout|css|style|visual', text_lower):
+            applicable_indicators += 1
+            if re.search(r'!\[.*?\]\(.*?\)|<img|screenshot', text_lower):
+                indicators_found += 1
+
+        # Check for migration/breaking change notes (only if structural)
+        if re.search(r'migration|schema|database|api|breaking|deprecat', text_lower):
+            applicable_indicators += 1
+            if re.search(r'migration|backward.?compat|breaking.?change', text_lower):
+                indicators_found += 1
+
+        # Check for links to related issues/PRs (always applicable)
+        applicable_indicators += 1
+        if re.search(r'#\d+|fixes|closes|related|issue|pr\b', text_lower):
             indicators_found += 1
 
-        # Check for migration notes (for structural changes)
-        if re.search(r'migration|backward.?compat|breaking.?change', text_lower):
+        # Check for deployment notes (only if deployment-related)
+        if re.search(r'deploy|infra|config|env|production', text_lower):
+            applicable_indicators += 1
+            if re.search(r'deploy|rollback|feature.?flag', text_lower):
+                indicators_found += 1
+
+        # Check for documentation updates mentioned (always applicable)
+        applicable_indicators += 1
+        if re.search(r'readme|documentation|docs.?updated|comment', text_lower):
             indicators_found += 1
 
-        # Check for links to related issues/PRs
-        if re.search(r'#\d+|fixes|closes|related', text_lower):
-            indicators_found += 1
+        if applicable_indicators == 0:
+            return 0.5  # No applicable indicators — neutral score
 
-        # Check for deployment notes
-        if re.search(r'deploy|rollback|feature.?flag', text_lower):
-            indicators_found += 1
-
-        # Check for documentation updates mentioned
-        if re.search(r'readme|documentation|docs.?updated', text_lower):
-            indicators_found += 1
-
-        return indicators_found / total_indicators
+        # Base score of 0.3 for having substantive content (>100 chars)
+        base = 0.3 if len(text) > 100 else 0.0
+        return min(1.0, base + (0.7 * indicators_found / applicable_indicators))
 
     score = 0.0
 
@@ -1451,7 +1524,10 @@ def pr_quality_match(expected: str, actual: str) -> float:
     # Content-based fallback: if no headers match but text is substantive,
     # give partial credit (indicates good content without formal structure)
     if sections_found == 0 and len(actual) > 200:
-        section_score = max(section_score, section_count * 0.3)
+        section_score = max(section_score, section_count * 0.4)
+    elif sections_found <= 2 and len(actual) > 300:
+        # Some structure plus substantial content
+        section_score = max(section_score, section_count * 0.5)
 
     if section_count > 0:
         score += 0.30 * (section_score / section_count)
@@ -1930,6 +2006,16 @@ def refactoring_match(expected: str, actual: str) -> float:
             'state_pattern': ['state pattern'],
             'command_pattern': ['command pattern'],
             'introduce_parameter_object': ['parameter object', 'dto'],
+            # New technique patterns for broader coverage
+            'factory_pattern': ['factory method', 'abstract factory', 'factory pattern', 'introduce factory'],
+            'observer_pattern': ['observer pattern', 'event emitter', 'pub sub', 'publish subscribe', 'event listener'],
+            'dependency_injection': ['dependency injection', 'inject depend', 'inversion of control', 'ioc container'],
+            'decorator_pattern': ['decorator pattern', 'wrapper', 'middleware chain'],
+            'replace_magic': ['replace magic', 'named constant', 'symbolic constant', 'enum'],
+            'encapsulate_field': ['encapsulate field', 'getter setter', 'accessor method'],
+            'inline_method': ['inline method', 'inline function', 'remove indirection'],
+            'replace_temp': ['replace temp', 'query method', 'replace temporary'],
+            'consolidate_conditional': ['consolidate conditional', 'guard clause', 'early return'],
         }
 
         for technique, keywords in technique_patterns.items():

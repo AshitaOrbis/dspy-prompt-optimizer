@@ -1,0 +1,16 @@
+{
+  "code-reviewer": 0.525,
+  "test-writer": 0.608,
+  "security-auditor": 0.760,
+  "performance-analyzer": 0.748,
+  "pr-preparer": 0.790,
+  "refactoring-advisor": 0.733,
+  "debugger": 0.933,
+  "feature-implementer": 0.565,
+  "capability-evaluator": 1.000,
+  "publication-review-opus": 0.622,
+  "publication-review-gpt": 0.533,
+  "publication-review-gemini": 0.532,
+  "mcp-search-framework": 1.000,
+  "mgrep-guide": 1.000
+}

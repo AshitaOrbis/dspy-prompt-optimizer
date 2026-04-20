@@ -199,7 +199,10 @@ def transform_severity_demo(
         lines.append("")
         lines.append("### Key Issues")
         for i, issue in enumerate(details.issues[:3]):
-            severity = issue.get('severity', 'unknown').capitalize()
+            # severity can be None (not just missing) — extractor sets it
+            # to None when it cannot infer a severity
+            severity_raw = issue.get('severity') or 'unknown'
+            severity = severity_raw.capitalize() if isinstance(severity_raw, str) else 'Unknown'
             title = issue.get('title', '')[:80]
             file_ref = ""
             if issue.get('file'):
@@ -475,6 +478,142 @@ def _extract_reason(text: str, selection: str) -> str:
     return f"Best match for the query type."
 
 
+def transform_writing_review_demo(
+    input_text: str,
+    output_text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> TransformedDemo:
+    """
+    Transform verbose writing-review demo into condensed per-perspective summary.
+
+    Input: truncated to first 500 words.
+    Output: one condensed block per perspective (Editorial Critic, Target Reader,
+    Tone Analyst, Technical Accuracy, Fact-Check Summary, Overall Assessment),
+    keeping the first 3 lines of each section. Capped at ~300 words.
+    """
+    import re
+
+    words = input_text.split()
+    truncated_input = (
+        " ".join(words[:500]) + "\n\n[...truncated...]"
+        if len(words) > 500
+        else input_text
+    )
+
+    perspective_headers = [
+        "Editorial Critic", "Target Reader", "Tone Analyst",
+        "Technical Accuracy", "Fact-Check Summary", "Overall Assessment",
+    ]
+    pattern = re.compile(
+        r"##\s+(" + "|".join(re.escape(h) for h in perspective_headers) + r")[^\n]*\n(.*?)(?=\n##\s+|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    sections = []
+    for m in pattern.finditer(output_text):
+        header = m.group(1).strip()
+        body = m.group(2).strip()
+        first_block_lines = []
+        for line in body.splitlines():
+            s = line.strip()
+            if not s:
+                if first_block_lines:
+                    break
+                continue
+            first_block_lines.append(s)
+            if len(first_block_lines) >= 3:
+                break
+        condensed = " ".join(first_block_lines)
+        if condensed:
+            sections.append(f"## {header}\n{condensed}")
+
+    structured = "\n\n".join(sections) if sections else output_text[:500]
+
+    out_words = structured.split()
+    if len(out_words) > 300:
+        structured = " ".join(out_words[:300]) + "..."
+
+    return TransformedDemo(
+        input_text=truncated_input,
+        output_text=structured,
+        original_output=output_text,
+        transformation_applied="writing_review",
+    )
+
+
+def transform_factcheck_demo(
+    input_text: str,
+    output_text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> TransformedDemo:
+    """
+    Transform verbose fact-check report into compact verdict summary.
+
+    Input: truncated to first 500 words.
+    Output: top 5 claim verdicts pulled from the Claims Extracted table (or
+    fallback to "### Claim N" + "**Verdict**" pairs), each trimmed to one
+    line, plus a brief Summary block. Capped at ~300 words.
+    """
+    import re
+
+    words = input_text.split()
+    truncated_input = (
+        " ".join(words[:500]) + "\n\n[...truncated...]"
+        if len(words) > 500
+        else input_text
+    )
+
+    verdicts = []
+
+    # 1) Try markdown table rows: | # | claim | type | para | verdict | ... |
+    table_rows = re.findall(
+        r"\|\s*\d+\s*\|([^|\n]+)\|[^|\n]*\|[^|\n]*\|\s*([A-Z][A-Z '\-/]+)\s*\|",
+        output_text,
+    )
+    for claim, verdict in table_rows[:5]:
+        claim = claim.strip()[:100]
+        verdicts.append(f"- [{verdict.strip()}] {claim}")
+
+    # 2) Fall back to "### Claim N:" / "**Verdict:**" pairs
+    if not verdicts:
+        claim_blocks = re.findall(
+            r"###\s*Claim\s*\d+[:\s]*([^\n]+).*?\*\*Verdict\*\*[:\s]*([^\n]+)",
+            output_text, re.DOTALL,
+        )
+        for claim, verdict in claim_blocks[:5]:
+            verdicts.append(f"- [{verdict.strip()[:40]}] {claim.strip()[:100]}")
+
+    # 3) Summary counts block as last resort
+    summary_match = re.search(
+        r"(?:##\s*Summary|Total claims)[^#]*", output_text, re.DOTALL,
+    )
+    summary_snippet = ""
+    if summary_match:
+        lines = [l.strip() for l in summary_match.group(0).splitlines()
+                 if l.strip() and len(l.strip()) < 120]
+        summary_snippet = "\n".join(lines[:6])
+
+    parts = ["## Fact-Check Summary"]
+    if summary_snippet:
+        parts.append(summary_snippet)
+    if verdicts:
+        parts.append("### Top Claims")
+        parts.extend(verdicts)
+
+    structured = "\n".join(parts) if (verdicts or summary_snippet) else output_text[:500]
+
+    out_words = structured.split()
+    if len(out_words) > 300:
+        structured = " ".join(out_words[:300]) + "..."
+
+    return TransformedDemo(
+        input_text=truncated_input,
+        output_text=structured,
+        original_output=output_text,
+        transformation_applied="fact_check",
+    )
+
+
 # Mapping from metric types to transformer functions
 TRANSFORMER_MAP: Dict[str, Callable] = {
     # Skill transformers
@@ -495,6 +634,12 @@ TRANSFORMER_MAP: Dict[str, Callable] = {
     # Publication review
     "publication_review": transform_review_demo,
     "publication_review_match": transform_review_demo,
+    # Writing review (Tier 3 skill)
+    "writing_review": transform_writing_review_demo,
+    "writing_review_quality_match": transform_writing_review_demo,
+    # Fact-checker (Tier 2 agent)
+    "fact_check": transform_factcheck_demo,
+    "fact_check_quality_match": transform_factcheck_demo,
     "default": transform_passthrough,
 }
 
@@ -514,6 +659,10 @@ TARGET_TRANSFORMER_MAP: Dict[str, Callable] = {
     "publication-review-gpt": transform_review_demo,
     "publication-review-gemini": transform_review_demo,
     "publication-review-opus": transform_review_demo,
+    # Writing review skill
+    "writing-review": transform_writing_review_demo,
+    # Fact-checker agent
+    "fact-checker": transform_factcheck_demo,
 }
 
 

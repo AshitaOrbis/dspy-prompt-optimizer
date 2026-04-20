@@ -420,6 +420,7 @@ class VerificationSuite:
         run_cross_validation: bool = False,
         k_folds: int = 5,
         verbose: bool = True,
+        data_basenames: Optional[Dict[str, str]] = None,
     ) -> VerificationReport:
         """
         Run complete verification suite on multiple agents.
@@ -463,8 +464,12 @@ class VerificationSuite:
                     print(f"  WARNING: No metric function for {agent_name}, skipping")
                 continue
 
-            # Holdout evaluation
-            holdout_path = holdout_data_dir / f"{agent_name}-holdout.jsonl"
+            # Holdout evaluation — resolve via data_basenames mapping or direct name
+            data_basename = data_basenames.get(agent_name, agent_name) if data_basenames else agent_name
+            holdout_path = holdout_data_dir / f"{data_basename}-holdout.jsonl"
+            if not holdout_path.exists():
+                # Fallback: try agent name directly
+                holdout_path = holdout_data_dir / f"{agent_name}-holdout.jsonl"
             if holdout_path.exists():
                 holdout_data = self.load_holdout_data(holdout_path)
                 try:
@@ -551,6 +556,104 @@ class VerificationSuite:
             cross_validation_results=cv_results,
             summary=summary,
         )
+
+
+def pre_flight_holdout_check(
+    agent_name: str,
+    new_optimized: OptimizedPrompt,
+    holdout_data: List[TrainingExample],
+    metric_fn: Callable[[str, str], float],
+    runner: ClaudeRunner,
+    storage: DemoStorage,
+    min_improvement: float = 0.0,
+    verbose: bool = True,
+) -> Tuple[bool, float, Optional[float]]:
+    """
+    Check if a new optimization beats the existing one on holdout data
+    before saving to _latest.json.
+
+    Prevents the regression pattern where save_optimized_prompt overwrites
+    better prompts with worse ones (cf. code-reviewer 0.525 -> 0.314 incident).
+
+    Args:
+        agent_name: Name of the agent/skill
+        new_optimized: The newly optimized prompt to evaluate
+        holdout_data: Holdout examples for evaluation
+        metric_fn: Metric function for scoring
+        runner: ClaudeRunner for running evaluation
+        storage: DemoStorage to load existing _latest.json
+        min_improvement: New must beat existing by at least this much (default: tie OK)
+        verbose: Print progress
+
+    Returns:
+        Tuple of (should_deploy, new_score, existing_score).
+        existing_score is None if no prior optimization exists.
+    """
+    if verbose:
+        print(f"\n{'='*50}")
+        print(f"PRE-FLIGHT HOLDOUT CHECK: {agent_name}")
+        print(f"{'='*50}")
+
+    # Evaluate the new optimization on holdout
+    new_prompt = new_optimized.to_prompt()
+    new_scores = []
+    for i, example in enumerate(holdout_data):
+        full_prompt = f"{new_prompt}\n\n## New Input\n\n{example.input_text}"
+        result = runner.run(full_prompt)
+        if result.success:
+            score = metric_fn(example.expected_output, result.output)
+            new_scores.append(score)
+            if verbose:
+                print(f"  [new {i+1}/{len(holdout_data)}] Score: {score:.3f}")
+        else:
+            if verbose:
+                print(f"  [new {i+1}/{len(holdout_data)}] FAILED: {result.error}")
+
+    new_score = sum(new_scores) / len(new_scores) if new_scores else 0.0
+
+    # Load and evaluate existing optimization (if any)
+    existing = storage.load_optimized_prompt(agent_name)
+    existing_score = None
+
+    if existing and existing.demos:
+        existing_prompt = existing.to_prompt()
+        existing_scores = []
+        for i, example in enumerate(holdout_data):
+            full_prompt = f"{existing_prompt}\n\n## New Input\n\n{example.input_text}"
+            result = runner.run(full_prompt)
+            if result.success:
+                score = metric_fn(example.expected_output, result.output)
+                existing_scores.append(score)
+                if verbose:
+                    print(f"  [existing {i+1}/{len(holdout_data)}] Score: {score:.3f}")
+            else:
+                if verbose:
+                    print(f"  [existing {i+1}/{len(holdout_data)}] FAILED: {result.error}")
+
+        existing_score = sum(existing_scores) / len(existing_scores) if existing_scores else 0.0
+
+    # Decision
+    if existing_score is None:
+        # No prior optimization — always deploy
+        should_deploy = True
+        if verbose:
+            print(f"\n  No existing optimization. New score: {new_score:.3f}")
+            print(f"  Decision: DEPLOY (first optimization)")
+    else:
+        improvement = new_score - existing_score
+        should_deploy = improvement >= -min_improvement  # deploy if at least as good
+
+        if verbose:
+            print(f"\n  Existing score: {existing_score:.3f}")
+            print(f"  New score:      {new_score:.3f}")
+            print(f"  Improvement:    {improvement:+.3f}")
+            print(f"  Min required:   {-min_improvement:+.3f}")
+            if should_deploy:
+                print(f"  Decision: DEPLOY (improvement >= threshold)")
+            else:
+                print(f"  Decision: SKIP (regression detected, keeping existing)")
+
+    return should_deploy, new_score, existing_score
 
 
 def generate_verification_report(

@@ -326,6 +326,8 @@ def main():
                         help="Run holdout evaluation using saved optimized prompt")
     parser.add_argument("--reset", action="store_true",
                         help="Clear checkpoint for model(s) and start fresh")
+    parser.add_argument("--holdout-gate", action="store_true",
+                        help="Compare holdout score against previous before keeping _latest.json")
     parser.add_argument("-v", "--verbose", action="store_true", default=True)
     parser.add_argument("-q", "--quiet", action="store_true")
 
@@ -427,6 +429,24 @@ def main():
                   f"Consider lowering --threshold or re-running for more examples.")
             continue
 
+        # Backup existing _latest.json if holdout gate is enabled
+        target_name = f"publication-review-{model}"
+        latest_path = storage.prompts_dir / f"{target_name}_latest.json"
+        backup_path = storage.prompts_dir / f"{target_name}_latest.json.pre-gate"
+        previous_holdout = None
+
+        if args.holdout_gate and latest_path.exists():
+            import shutil
+            shutil.copy2(latest_path, backup_path)
+            # Read the previous holdout score from status.json
+            if STATUS_PATH.exists():
+                with open(STATUS_PATH) as sf:
+                    prev_status = json.load(sf)
+                prev_entry = prev_status.get(target_name, {})
+                previous_holdout = prev_entry.get("holdout_score")
+            if verbose:
+                print(f"  Holdout gate: backed up _latest.json (prev holdout: {previous_holdout})")
+
         # Build and save optimized prompt
         opt_prompt = build_optimized_prompt(
             base_prompt=base_prompt,
@@ -435,12 +455,43 @@ def main():
             threshold=args.threshold,
             avg_score=avg_score,
         )
-        storage.save_optimized_prompt(f"publication-review-{model}", opt_prompt)
+        storage.save_optimized_prompt(target_name, opt_prompt)
         print(f"  Saved optimized prompt ({len(demos)} demos)")
 
         # Holdout evaluation
         print(f"\nHoldout phase...")
         holdout_score = run_holdout(model, runner, storage, args.threshold, verbose)
+
+        # Holdout gate check: restore if regression detected
+        if args.holdout_gate and holdout_score is not None and backup_path.exists():
+            # If previous_holdout is missing/null in status.json, evaluate the
+            # backup prompt freshly on the same holdout data. Otherwise trust
+            # the recorded holdout as the comparison point.
+            if previous_holdout is None:
+                print(f"\n  status.json has no previous holdout; evaluating backup freshly...")
+                # Temporarily swap backup into _latest so run_holdout uses it
+                import shutil
+                current_latest_bytes = latest_path.read_bytes() if latest_path.exists() else None
+                shutil.copy2(backup_path, latest_path)
+                try:
+                    previous_holdout = run_holdout(model, runner, storage, args.threshold, verbose)
+                finally:
+                    # Restore the new optimization for the gate comparison
+                    if current_latest_bytes is not None:
+                        latest_path.write_bytes(current_latest_bytes)
+                print(f"  Backup holdout = {previous_holdout}")
+
+            if previous_holdout is not None:
+                if holdout_score < previous_holdout - 0.02:
+                    import shutil
+                    print(f"\n  HOLDOUT GATE FAILED: {holdout_score:.3f} < {previous_holdout:.3f} - 0.02")
+                    print(f"  Restoring previous _latest.json")
+                    shutil.copy2(backup_path, latest_path)
+                    holdout_score = previous_holdout
+                else:
+                    print(f"\n  HOLDOUT GATE PASSED: {holdout_score:.3f} >= {previous_holdout:.3f} - 0.02")
+                    if backup_path.exists():
+                        backup_path.unlink()
 
         # Update status
         update_status(model, {

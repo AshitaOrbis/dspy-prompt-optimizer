@@ -56,7 +56,11 @@ def _build_subprocess_env() -> Optional[dict]:
     may attempt tool-driven exfiltration. Returns None to mean "inherit".
     """
     if os.environ.get("PROMPT_OPTIMIZER_SCRUB_ENV", "").lower() not in ("1", "true", "yes"):
-        return None
+        # Inherit the parent environment, minus CLAUDECODE: its presence makes
+        # a nested `claude -p` invocation fail with a nested-session error.
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        return env
 
     # Minimal allowlist needed for claude to locate config/auth and run.
     allowlist = {
@@ -73,6 +77,36 @@ def _build_subprocess_env() -> Optional[dict]:
     # Guarantee a usable PATH even if the parent had none.
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     return env
+
+
+def _find_claude_binary() -> str:
+    """Find the claude binary, checking PATH and common locations."""
+    # Try PATH first
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    # Check common nvm/node locations
+    home = os.path.expanduser("~")
+    for candidate in [
+        os.path.join(home, ".nvm/versions/node", d, "bin/claude")
+        for d in sorted(os.listdir(os.path.join(home, ".nvm/versions/node")), reverse=True)
+        if os.path.isdir(os.path.join(home, ".nvm/versions/node", d))
+    ] if os.path.isdir(os.path.join(home, ".nvm/versions/node")) else []:
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Check npm global
+    npm_global = os.path.join(home, ".npm-global/bin/claude")
+    if os.path.isfile(npm_global):
+        return npm_global
+
+    # Fallback to bare name (let subprocess handle the error)
+    return "claude"
+
+
+# Resolve claude binary path once at import time
+CLAUDE_BINARY = _find_claude_binary()
 
 
 def estimate_timeout(input_text: str, base_timeout: int = 180) -> int:
@@ -138,7 +172,7 @@ class ClaudeRunner:
         # PATH-hijack where a project-local or world-writable './claude' is
         # executed instead of the real CLI. Fall back to the bare name if not
         # found (the subprocess call will then surface a clear error).
-        self.claude_bin = shutil.which("claude") or "claude"
+        self.claude_bin = _find_claude_binary()
 
         # Whether to pass --dangerously-skip-permissions. This bypass is
         # INHERENT to unattended/non-interactive optimization (the CLI would

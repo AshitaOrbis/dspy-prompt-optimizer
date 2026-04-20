@@ -43,6 +43,16 @@ declare -A DATASET_MAP=(
     ["security-auditor"]="security-audits"
     ["performance-analyzer"]="performance-analysis"
     ["capability-evaluator"]="evaluations"
+    # Tier 1
+    ["pr-preparer"]="pr-preparations"
+    ["refactoring-advisor"]="refactoring-decisions"
+    # Tier 2
+    ["capability-discoverer"]="discoveries"
+    ["fact-checker"]="fact-checks"
+    ["web-researcher"]="web-research"
+    # Tier 3
+    ["writing-review"]="writing-reviews"
+    ["session-handoff"]="session-handoffs"
 )
 
 # Target -> metric mapping
@@ -55,6 +65,16 @@ declare -A METRIC_MAP=(
     ["security-auditor"]="security_cwe"
     ["performance-analyzer"]="complexity"
     ["capability-evaluator"]="evaluation_score"
+    # Tier 1
+    ["pr-preparer"]="pr_quality"
+    ["refactoring-advisor"]="refactoring"
+    # Tier 2
+    ["capability-discoverer"]="discovery_quality"
+    ["fact-checker"]="fact_check_quality"
+    ["web-researcher"]="research_quality"
+    # Tier 3
+    ["writing-review"]="writing_review_quality"
+    ["session-handoff"]="handoff_quality"
 )
 
 # Target type (agent or skill)
@@ -67,6 +87,16 @@ declare -A TARGET_TYPE=(
     ["security-auditor"]="agent"
     ["performance-analyzer"]="agent"
     ["capability-evaluator"]="agent"
+    # Tier 1
+    ["pr-preparer"]="agent"
+    ["refactoring-advisor"]="agent"
+    # Tier 2
+    ["capability-discoverer"]="agent"
+    ["fact-checker"]="agent"
+    ["web-researcher"]="agent"
+    # Tier 3
+    ["writing-review"]="skill"
+    ["session-handoff"]="skill"
 )
 
 usage() {

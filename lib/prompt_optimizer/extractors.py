@@ -799,6 +799,7 @@ def _extract_test_explicit_count(text: str) -> Tuple[int, bool]:
     """Strategy 1: Look for explicit test counts."""
     patterns = [
         r'total[:\s]*(\d+)\s*tests?',
+        r'total\s+tests?[:\s]*(\d+)',  # matches "Total Tests: 12" (format instruction output)
         r'(\d+)\s*tests?\s*total',
         r'(\d+)\s*tests?\s*(?:written|generated|created)',
         r'test\s*count[:\s]*(\d+)',
