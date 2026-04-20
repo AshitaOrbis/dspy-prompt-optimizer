@@ -1,0 +1,83 @@
+[
+  {
+    "post": "032-the-etymology-tax.md",
+    "size": "medium",
+    "words": 1916,
+    "config": "gpt-5.4_xhigh",
+    "status": "timeout",
+    "elapsed": 480,
+    "error": "Timeout after 480s"
+  },
+  {
+    "post": "032-the-etymology-tax.md",
+    "size": "medium",
+    "words": 1916,
+    "config": "gpt-5.4_high",
+    "status": "success",
+    "elapsed": 369.2089283466339,
+    "output_len": 7927
+  },
+  {
+    "post": "032-the-etymology-tax.md",
+    "size": "medium",
+    "words": 1916,
+    "config": "gpt-5.4_medium",
+    "status": "success",
+    "elapsed": 170.41936588287354,
+    "output_len": 6286
+  },
+  {
+    "post": "025-the-logistics-gap.md",
+    "size": "large",
+    "words": 3054,
+    "config": "gpt-5.4_xhigh",
+    "status": "timeout",
+    "elapsed": 480,
+    "error": "Timeout after 480s"
+  },
+  {
+    "post": "025-the-logistics-gap.md",
+    "size": "large",
+    "words": 3054,
+    "config": "gpt-5.4_high",
+    "status": "timeout",
+    "elapsed": 480,
+    "error": "Timeout after 480s"
+  },
+  {
+    "post": "025-the-logistics-gap.md",
+    "size": "large",
+    "words": 3054,
+    "config": "gpt-5.4_medium",
+    "status": "success",
+    "elapsed": 136.32047152519226,
+    "output_len": 7748
+  },
+  {
+    "post": "037-the-model-generation-audit.md",
+    "size": "xlarge",
+    "words": 4055,
+    "config": "gpt-5.4_xhigh",
+    "status": "timeout",
+    "elapsed": 480,
+    "error": "Timeout after 480s"
+  },
+  {
+    "post": "037-the-model-generation-audit.md",
+    "size": "xlarge",
+    "words": 4055,
+    "config": "gpt-5.4_high",
+    "status": "timeout",
+    "elapsed": 480,
+    "error": "Timeout after 480s"
+  },
+  {
+    "post": "037-the-model-generation-audit.md",
+    "size": "xlarge",
+    "words": 4055,
+    "config": "gpt-5.4_medium",
+    "status": "success",
+    "elapsed": 282.78730964660645,
+    "output_len": 7896
+  }
+]

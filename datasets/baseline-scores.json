@@ -1,16 +1,17 @@
 {
-  "code-reviewer": 0.525,
+  "code-reviewer": 0.466,
   "test-writer": 0.608,
-  "security-auditor": 0.760,
+  "security-auditor": 0.76,
   "performance-analyzer": 0.748,
-  "pr-preparer": 0.790,
+  "pr-preparer": 0.79,
   "refactoring-advisor": 0.733,
   "debugger": 0.933,
   "feature-implementer": 0.565,
-  "capability-evaluator": 1.000,
+  "capability-evaluator": 1.0,
   "publication-review-opus": 0.622,
   "publication-review-gpt": 0.533,
   "publication-review-gemini": 0.532,
-  "mcp-search-framework": 1.000,
-  "mgrep-guide": 1.000
+  "mcp-search-framework": 1.0,
+  "mgrep-guide": 1.0,
+  "code-reviewer_note": "Updated 2026-04-19: expanded from 3-example Sonnet baseline (0.525) to 8-example Haiku baseline (0.466). Holdout now covers 8 categories: security, code_quality, performance, error_handling, concurrency, memory, null_safety, best_practices."
 }
