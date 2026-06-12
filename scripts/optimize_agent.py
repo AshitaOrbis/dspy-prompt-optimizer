@@ -56,6 +56,7 @@ from prompt_optimizer import (
 from prompt_optimizer.bootstrap import TrainingExample
 from prompt_optimizer.metrics import evaluation_score_metric, numeric_score_match
 from prompt_optimizer.utils import find_agent_path, parse_markdown_prompt
+from prompt_optimizer.validation import validate_name, contained_path, ValidationError
 
 
 # Available metrics
@@ -107,10 +108,11 @@ def load_agent_prompt(agent_name: str) -> str:
 
 def save_optimized_agent(agent_name: str, optimized_content: str, output_dir: str):
     """Save optimized agent to output directory."""
+    validate_name(agent_name, kind="agent name")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    file_path = output_path / f"{agent_name}-optimized.md"
+    file_path = contained_path(output_path, f"{agent_name}-optimized.md")
     with open(file_path, "w") as f:
         f.write(optimized_content)
 
@@ -276,6 +278,14 @@ def main():
         max_overfitting_gap=args.max_overfitting_gap,
         dropout_rate=args.dropout,
     )
+
+    # Validate the agent name up front, before it is used to build any path or
+    # passed to a claude run.
+    try:
+        validate_name(args.agent, kind="agent name")
+    except ValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Load agent prompt
     try:

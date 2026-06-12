@@ -125,6 +125,56 @@ if [[ -z "$TARGETS" ]]; then
     usage
 fi
 
+# --- Input validation (defense against injection / path traversal / cost abuse) ---
+# Enumerated options are checked against an explicit allowlist; free-form names
+# are restricted to a safe character class. This runs BEFORE any value is used
+# to build a command, a path, or a status file.
+MAX_TARGETS="${MAX_TARGETS:-25}"
+
+if [[ ! "$ALGORITHM" =~ ^(bootstrap|copro|iterative)$ ]]; then
+    echo "Error: invalid --algorithm '$ALGORITHM' (allowed: bootstrap|copro|iterative)" >&2
+    exit 2
+fi
+if [[ ! "$MODEL" =~ ^(haiku|sonnet|opus)$ ]]; then
+    echo "Error: invalid --model '$MODEL' (allowed: haiku|sonnet|opus)" >&2
+    exit 2
+fi
+if [[ ! "$CV_FOLDS" =~ ^[0-9]+$ ]]; then
+    echo "Error: --cv-folds must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ ! "$DROPOUT" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: --dropout must be a number" >&2
+    exit 2
+fi
+# Targets: comma-separated list of validated identifiers. Reject anything that
+# could break out of a shell word, a path, or JSON.
+if [[ ! "$TARGETS" =~ ^[A-Za-z0-9_.,-]+$ ]]; then
+    echo "Error: --targets contains illegal characters (allowed: letters, digits, _ . - and ',')" >&2
+    exit 2
+fi
+# Per-target checks: no leading dash/dot, no '..', enforce count cap.
+IFS=',' read -ra _validate_targets <<< "$TARGETS"
+if (( ${#_validate_targets[@]} > MAX_TARGETS )); then
+    echo "Error: too many targets (${#_validate_targets[@]} > MAX_TARGETS=$MAX_TARGETS)" >&2
+    exit 2
+fi
+for _t in "${_validate_targets[@]}"; do
+    if [[ -z "$_t" || "$_t" == -* || "$_t" == .* || "$_t" == *..* || ! "$_t" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        echo "Error: invalid target name: '$_t'" >&2
+        exit 2
+    fi
+done
+unset _validate_targets _t
+
+# Pin the python interpreter at startup to avoid PATH-hijack of a relative
+# 'python3' picked up from a world-writable or project-local directory.
+PYTHON_BIN="$(command -v python3 || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+    echo "Error: python3 not found on PATH" >&2
+    exit 2
+fi
+
 # Script directory for relative imports
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -132,7 +182,18 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Write initial status
+# Encode a bash array as a JSON array string using jq (safe for any content).
+to_json_array() {
+    if (( $# == 0 )); then
+        echo '[]'
+        return
+    fi
+    printf '%s\n' "$@" | jq -R . | jq -s -c .
+}
+
+# Write status as JSON. Uses jq to encode every value so that target names
+# containing quotes, backslashes, or control characters cannot corrupt or inject
+# into status.json (the old sed-based string surgery was injection-prone).
 write_status() {
     local current="$1"
     local progress="$2"
@@ -140,17 +201,37 @@ write_status() {
     local failed=("${!4}")
     local scores="${5:-{}}"
 
-    cat > "$OUTPUT_DIR/status.json" << EOF
-{
-  "started": "$(date -Iseconds)",
-  "targets": [$(echo "$TARGETS" | sed 's/,/", "/g' | sed 's/^/"/' | sed 's/$/"/')],
-  "completed": [$(printf '"%s", ' "${completed[@]}" 2>/dev/null | sed 's/, $//')],
-  "failed": [$(printf '"%s", ' "${failed[@]}" 2>/dev/null | sed 's/, $//')],
-  "current": "$current",
-  "progress": "$progress",
-  "scores": $scores
-}
-EOF
+    # Validate scores is well-formed JSON; fall back to {} if not.
+    if ! echo "$scores" | jq -e . >/dev/null 2>&1; then
+        scores="{}"
+    fi
+
+    local targets_arr
+    IFS=',' read -ra targets_arr <<< "$TARGETS"
+
+    local targets_json completed_json failed_json
+    targets_json="$(to_json_array "${targets_arr[@]}")"
+    completed_json="$(to_json_array ${completed[@]+"${completed[@]}"})"
+    failed_json="$(to_json_array ${failed[@]+"${failed[@]}"})"
+
+    jq -n \
+        --arg started "$(date -Iseconds)" \
+        --arg current "$current" \
+        --arg progress "$progress" \
+        --argjson scores "$scores" \
+        --argjson targets "$targets_json" \
+        --argjson completed "$completed_json" \
+        --argjson failed "$failed_json" \
+        '{
+            started: $started,
+            targets: $targets,
+            completed: $completed,
+            failed: $failed,
+            current: $current,
+            progress: $progress,
+            scores: $scores
+        }' > "$OUTPUT_DIR/status.json.tmp" \
+        && mv "$OUTPUT_DIR/status.json.tmp" "$OUTPUT_DIR/status.json"
 }
 
 # Main optimization function
@@ -198,7 +279,7 @@ run_optimization() {
         fi
 
         # Build command based on target type using batch_optimize.py
-        local cmd=(python3 "$SCRIPT_DIR/batch_optimize.py")
+        local cmd=("$PYTHON_BIN" "$SCRIPT_DIR/batch_optimize.py")
 
         if [[ "$target_type" == "skill" ]]; then
             cmd+=(--skills "$target")
@@ -225,7 +306,7 @@ run_optimization() {
             if [[ -f "$holdout_path" ]]; then
                 echo "[$(date -Iseconds)] Running holdout validation..."
 
-                local holdout_cmd=(python3 "$SCRIPT_DIR/verify_optimizations.py")
+                local holdout_cmd=("$PYTHON_BIN" "$SCRIPT_DIR/verify_optimizations.py")
 
                 # Use --skill or --agent based on target type
                 if [[ "$target_type" == "skill" ]]; then
@@ -316,23 +397,24 @@ else
     echo "Logs: $OUTPUT_DIR/optimization.log"
     echo "Status: $OUTPUT_DIR/status.json"
 
-    nohup bash -c "
-        cd '$PROJECT_DIR'
-        $(declare -f run_optimization)
-        $(declare -f write_status)
-        $(declare -p DATASET_MAP)
-        $(declare -p METRIC_MAP)
-        $(declare -p TARGET_TYPE)
-        TARGETS='$TARGETS'
-        ALGORITHM='$ALGORITHM'
-        MODEL='$MODEL'
-        CV_FOLDS='$CV_FOLDS'
-        DROPOUT='$DROPOUT'
-        OUTPUT_DIR='$OUTPUT_DIR'
-        DATASETS_DIR='$DATASETS_DIR'
-        SCRIPT_DIR='$SCRIPT_DIR'
-        run_optimization
-    " > "$OUTPUT_DIR/optimization.log" 2>&1 &
+    # SECURITY: Do NOT serialize this script's source with interpolated values
+    # into `bash -c "..."`. The previous implementation embedded $TARGETS et al.
+    # directly into a child shell program string, allowing a single quote in any
+    # argument to break out and execute arbitrary commands. Instead, re-exec this
+    # same script in --foreground mode with a proper argv array: every value is a
+    # distinct, non-evaluated argument, so no shell metacharacter can escape.
+    bg_cmd=(
+        "$BASH" "${BASH_SOURCE[0]}"
+        --foreground
+        --targets "$TARGETS"
+        --algorithm "$ALGORITHM"
+        --model "$MODEL"
+        --cv-folds "$CV_FOLDS"
+        --dropout "$DROPOUT"
+        --output-dir "$OUTPUT_DIR"
+        --datasets-dir "$DATASETS_DIR"
+    )
+    nohup "${bg_cmd[@]}" > "$OUTPUT_DIR/optimization.log" 2>&1 &
 
     echo $! > "$OUTPUT_DIR/pid"
     echo "PID: $(cat "$OUTPUT_DIR/pid")"

@@ -192,21 +192,37 @@ def _extract_bold_mention(text: str) -> Optional[str]:
     return None
 
 
+# Precompute (canonical, alias) pairs sorted by alias length descending so that
+# longer, more specific names match before their substrings. This prevents
+# "mgrep" being mis-extracted as "grep", or "codex-reply" as "codex".
+_ALIAS_PAIRS_BY_LENGTH = sorted(
+    [
+        (canonical, alias)
+        for canonical, aliases in CANONICAL_TOOLS.items()
+        for alias in ([canonical] + aliases)
+    ],
+    key=lambda pair: len(pair[1]),
+    reverse=True,
+)
+
+
 def _extract_direct_mention(text: str) -> Optional[str]:
     """
     Strategy 4: Look for direct tool name mentions in text.
 
-    Scans for known tool names anywhere in the text.
+    Scans for known tool names using word boundaries and longest-alias-first
+    ordering so that substrings (grep within mgrep, codex within codex-reply)
+    do not produce a wrong, shorter match.
     """
     text_lower = text.lower()
 
-    # Check for canonical tool names
-    for canonical, aliases in CANONICAL_TOOLS.items():
-        if canonical in text_lower:
+    for canonical, alias in _ALIAS_PAIRS_BY_LENGTH:
+        alias_lower = alias.lower()
+        # Boundary chars exclude the identifier characters used in tool names so
+        # 'grep' won't match inside 'mgrep'.
+        pattern = r"(?<![A-Za-z0-9_-])" + re.escape(alias_lower) + r"(?![A-Za-z0-9_-])"
+        if re.search(pattern, text_lower):
             return canonical
-        for alias in aliases:
-            if alias.lower() in text_lower:
-                return canonical
 
     return None
 
@@ -271,7 +287,7 @@ def extract_tool_from_verbose(text: str) -> Optional[str]:
     Returns:
         Canonical tool name or None if no tool could be extracted
     """
-    if not text or not text.strip():
+    if not isinstance(text, str) or not text.strip():
         return None
 
     # Strategy 1: Explicit headers
@@ -361,7 +377,7 @@ def extract_binary_decision(text: str) -> Optional[str]:
     Returns:
         "grep" or "mgrep" or None
     """
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
 
     text_lower = text.lower().strip()
@@ -419,7 +435,7 @@ def extract_tier(text: str) -> Optional[str]:
     Returns:
         "core", "specialized", or "deferred" or None
     """
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
 
     text_lower = text.lower().strip()
@@ -732,7 +748,7 @@ def extract_severity_details(text: str) -> SeverityDetails:
     Returns:
         SeverityDetails with counts and extracted issues
     """
-    if not text or not text.strip():
+    if not isinstance(text, str) or not text.strip():
         return SeverityDetails()
 
     all_issues = []
@@ -894,7 +910,7 @@ def extract_test_coverage_details(text: str) -> CoverageDetails:
     Returns:
         TestCoverageDetails with counts and test list
     """
-    if not text or not text.strip():
+    if not isinstance(text, str) or not text.strip():
         return TestCoverageDetails()
 
     all_tests = []
@@ -1060,7 +1076,7 @@ def extract_evaluation_details(text: str) -> EvaluationDetails:
     Returns:
         EvaluationDetails with score, decision, and criteria
     """
-    if not text or not text.strip():
+    if not isinstance(text, str) or not text.strip():
         return EvaluationDetails()
 
     # Strategy 1: Explicit score

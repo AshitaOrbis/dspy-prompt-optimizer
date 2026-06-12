@@ -45,6 +45,8 @@ from prompt_optimizer import (
 )
 from prompt_optimizer.bootstrap import TrainingExample
 from prompt_optimizer.storage import OptimizedPrompt
+from prompt_optimizer.utils import find_skill_path
+from prompt_optimizer.validation import validate_name, contained_path, ValidationError
 
 
 # Available metrics for skills
@@ -82,28 +84,11 @@ def load_training_data(path: str) -> list[TrainingExample]:
     return examples
 
 
-def find_skill_path(skill_name: str) -> Path:
-    """Find skill file in ~/.claude/skills/ or project skills."""
-    # Check user global skills
-    global_path = Path.home() / ".claude" / "skills" / skill_name / "SKILL.md"
-    if global_path.exists():
-        return global_path
-
-    # Check project skills
-    project_path = Path.cwd() / ".claude" / "skills" / skill_name / "SKILL.md"
-    if project_path.exists():
-        return project_path
-
-    # Check without SKILL.md wrapper
-    alt_global = Path.home() / ".claude" / "skills" / f"{skill_name}.md"
-    if alt_global.exists():
-        return alt_global
-
-    raise FileNotFoundError(f"Skill not found: {skill_name}")
-
-
 def load_skill_prompt(skill_name: str) -> str:
     """Load the base prompt for a skill."""
+    # Use the shared, name-validated + path-contained resolver (utils.find_skill_path)
+    # rather than a local copy, so '--skill ../../etc/foo' cannot traverse out of
+    # the skills directory.
     skill_path = find_skill_path(skill_name)
 
     with open(skill_path) as f:
@@ -120,10 +105,13 @@ def load_skill_prompt(skill_name: str) -> str:
 
 def save_optimized_skill(skill_name: str, optimized_content: str, output_dir: str):
     """Save optimized skill to output directory."""
+    validate_name(skill_name, kind="skill name")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    file_path = output_path / f"{skill_name}-optimized.md"
+    # Containment-check the derived path so the (validated) name still can't
+    # escape the output directory via any edge case.
+    file_path = contained_path(output_path, f"{skill_name}-optimized.md")
     with open(file_path, "w") as f:
         f.write(optimized_content)
 
@@ -247,6 +235,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Validate the skill name up front, before it is used to build any path or
+    # passed to a claude run. Rejects traversal/injection on the primary entry.
+    try:
+        validate_name(args.skill, kind="skill name")
+    except ValidationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Setup
     verbose = not args.quiet and args.verbose
@@ -398,7 +394,7 @@ def main():
             base_prompt,
             result.optimized_prompt.demos
         )
-        integrated_path = Path(args.output) / f"{args.skill}-integrated.md"
+        integrated_path = contained_path(Path(args.output), f"{args.skill}-integrated.md")
         with open(integrated_path, "w") as f:
             f.write(integrated_content)
         print(f"Saved integrated skill to: {integrated_path}")

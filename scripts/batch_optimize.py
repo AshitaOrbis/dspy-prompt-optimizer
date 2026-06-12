@@ -32,6 +32,7 @@ from pathlib import Path
 # Add lib to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
+from prompt_optimizer.validation import validate_name, contained_path
 from prompt_optimizer import (
     ClaudeRunner,
     DemoStorage,
@@ -100,14 +101,13 @@ SKILL_DATA_PATHS = {
 
 
 def find_agent_path(agent_name: str) -> Path:
-    """Find agent file in ~/.claude/agents/."""
-    # Check user global agents
-    global_path = Path.home() / ".claude" / "agents" / f"{agent_name}.md"
+    """Find agent file in ~/.claude/agents/ (name-validated, path-contained)."""
+    validate_name(agent_name, kind="agent name")
+    global_path = contained_path(Path.home() / ".claude" / "agents", f"{agent_name}.md")
     if global_path.exists():
         return global_path
 
-    # Check project agents
-    project_path = Path.cwd() / ".claude" / "agents" / f"{agent_name}.md"
+    project_path = contained_path(Path.cwd() / ".claude" / "agents", f"{agent_name}.md")
     if project_path.exists():
         return project_path
 
@@ -115,19 +115,17 @@ def find_agent_path(agent_name: str) -> Path:
 
 
 def find_skill_path(skill_name: str) -> Path:
-    """Find skill file in ~/.claude/skills/."""
-    # Check user global skills
-    global_path = Path.home() / ".claude" / "skills" / skill_name / "SKILL.md"
+    """Find skill file in ~/.claude/skills/ (name-validated, path-contained)."""
+    validate_name(skill_name, kind="skill name")
+    global_path = contained_path(Path.home() / ".claude" / "skills", skill_name, "SKILL.md")
     if global_path.exists():
         return global_path
 
-    # Check project skills
-    project_path = Path.cwd() / ".claude" / "skills" / skill_name / "SKILL.md"
+    project_path = contained_path(Path.cwd() / ".claude" / "skills", skill_name, "SKILL.md")
     if project_path.exists():
         return project_path
 
-    # Check without SKILL.md wrapper
-    alt_global = Path.home() / ".claude" / "skills" / f"{skill_name}.md"
+    alt_global = contained_path(Path.home() / ".claude" / "skills", f"{skill_name}.md")
     if alt_global.exists():
         return alt_global
 

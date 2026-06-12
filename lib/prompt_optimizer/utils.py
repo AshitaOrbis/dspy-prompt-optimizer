@@ -10,6 +10,8 @@ Provides centralized functions for:
 from pathlib import Path
 from typing import Optional
 
+from .validation import validate_name, contained_path
+
 
 def parse_markdown_prompt(content: str) -> str:
     """
@@ -54,9 +56,12 @@ def find_agent_path(agent_name: str, project_dir: Optional[Path] = None) -> Path
     """
     project_dir = project_dir or Path.cwd()
 
+    # Reject traversal/injection in the name, then enforce that each resolved
+    # path stays inside its intended agents directory.
+    validate_name(agent_name, kind="agent name")
     paths = [
-        Path.home() / ".claude" / "agents" / f"{agent_name}.md",
-        project_dir / ".claude" / "agents" / f"{agent_name}.md",
+        contained_path(Path.home() / ".claude" / "agents", f"{agent_name}.md"),
+        contained_path(project_dir / ".claude" / "agents", f"{agent_name}.md"),
     ]
 
     for p in paths:
@@ -90,10 +95,16 @@ def find_skill_path(skill_name: str, project_dir: Optional[Path] = None) -> Path
     """
     project_dir = project_dir or Path.cwd()
 
+    # Reject traversal/injection in the name. The directory-style skill paths
+    # (<base>/<name>/SKILL.md) are contained against the skills root; the flat
+    # variant (<base>/<name>.md) against the same root.
+    validate_name(skill_name, kind="skill name")
+    home_skills = Path.home() / ".claude" / "skills"
+    project_skills = project_dir / ".claude" / "skills"
     paths = [
-        Path.home() / ".claude" / "skills" / skill_name / "SKILL.md",
-        project_dir / ".claude" / "skills" / skill_name / "SKILL.md",
-        Path.home() / ".claude" / "skills" / f"{skill_name}.md",
+        contained_path(home_skills, skill_name, "SKILL.md"),
+        contained_path(project_skills, skill_name, "SKILL.md"),
+        contained_path(home_skills, f"{skill_name}.md"),
     ]
 
     for p in paths:

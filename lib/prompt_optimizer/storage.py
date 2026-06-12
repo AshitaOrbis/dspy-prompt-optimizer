@@ -4,10 +4,22 @@ Storage utilities for persisting optimized prompts and demo examples.
 
 import json
 import os
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+
+from .validation import validate_name, contained_path
+
+
+def _safe_fence(*bodies: str) -> str:
+    """Return a backtick fence longer than any backtick run in the bodies."""
+    max_ticks = 0
+    for body in bodies:
+        for m in re.finditer(r"`+", body or ""):
+            max_ticks = max(max_ticks, len(m.group(0)))
+    return "`" * max(3, max_ticks + 1)
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -66,18 +78,24 @@ class OptimizedPrompt:
         ]
 
         for i, demo in enumerate(self.demos, 1):
+            input_text = demo.input_text[:500] + ("..." if len(demo.input_text) > 500 else "")
+            output_text = demo.output_text[:1000] + ("..." if len(demo.output_text) > 1000 else "")
+            # Dynamic fences so demo content containing ``` cannot break out and
+            # become live instruction text when this markdown is deployed.
+            in_fence = _safe_fence(input_text)
+            out_fence = _safe_fence(output_text)
             lines.extend([
                 f"### Example {i} (Score: {demo.score:.2f})",
                 f"",
                 f"**Input:**",
-                f"```",
-                demo.input_text[:500] + ("..." if len(demo.input_text) > 500 else ""),
-                f"```",
+                in_fence,
+                input_text,
+                in_fence,
                 f"",
                 f"**Output:**",
-                f"```",
-                demo.output_text[:1000] + ("..." if len(demo.output_text) > 1000 else ""),
-                f"```",
+                out_fence,
+                output_text,
+                out_fence,
                 f"",
             ])
 
@@ -143,7 +161,8 @@ class DemoStorage:
         Returns:
             Path to saved file
         """
-        file_path = self.demos_dir / f"{agent_name}.json"
+        validate_name(agent_name, kind="agent name")
+        file_path = contained_path(self.demos_dir, f"{agent_name}.json")
         data = {
             "agent": agent_name,
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -163,7 +182,8 @@ class DemoStorage:
         Returns:
             List of Demo objects
         """
-        file_path = self.demos_dir / f"{agent_name}.json"
+        validate_name(agent_name, kind="agent name")
+        file_path = contained_path(self.demos_dir, f"{agent_name}.json")
         if not file_path.exists():
             return []
 
@@ -172,11 +192,18 @@ class DemoStorage:
 
         demos = []
         for d in data.get("demos", []):
+            if not isinstance(d, dict):
+                raise ValueError("Demo entry must be an object")
             # Validate required fields
             required = {"input_text", "output_text", "score"}
             missing = required - set(d.keys())
             if missing:
                 raise ValueError(f"Demo missing required fields: {missing}")
+            # Type-guard untrusted JSON before constructing the dataclass.
+            if not isinstance(d["input_text"], str) or not isinstance(d["output_text"], str):
+                raise ValueError("Demo input_text/output_text must be strings")
+            if not isinstance(d["score"], (int, float)):
+                raise ValueError("Demo score must be numeric")
             # Only pass known fields to Demo constructor
             demo_data = {k: v for k, v in d.items() if k in Demo.__dataclass_fields__}
             demos.append(Demo(**demo_data))
@@ -203,23 +230,24 @@ class DemoStorage:
         if format not in valid_formats:
             raise ValueError(f"format must be one of {valid_formats}, got '{format}'")
 
+        validate_name(agent_name, kind="agent name")
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         paths = {}
 
         if format in ("json", "both"):
-            json_path = self.prompts_dir / f"{agent_name}_{timestamp}.json"
+            json_path = contained_path(self.prompts_dir, f"{agent_name}_{timestamp}.json")
             with open(json_path, "w") as f:
                 json.dump(asdict(optimized), f, indent=2, cls=SafeJSONEncoder)
             paths["json"] = json_path
 
         if format in ("markdown", "both"):
-            md_path = self.prompts_dir / f"{agent_name}_{timestamp}.md"
+            md_path = contained_path(self.prompts_dir, f"{agent_name}_{timestamp}.md")
             with open(md_path, "w") as f:
                 f.write(optimized.to_markdown())
             paths["markdown"] = md_path
 
         # Also save as "latest"
-        latest_json = self.prompts_dir / f"{agent_name}_latest.json"
+        latest_json = contained_path(self.prompts_dir, f"{agent_name}_latest.json")
         with open(latest_json, "w") as f:
             json.dump(asdict(optimized), f, indent=2, cls=SafeJSONEncoder)
         paths["latest"] = latest_json
@@ -236,14 +264,20 @@ class DemoStorage:
         Returns:
             OptimizedPrompt or None if not found
         """
-        file_path = self.prompts_dir / f"{agent_name}_latest.json"
+        validate_name(agent_name, kind="agent name")
+        file_path = contained_path(self.prompts_dir, f"{agent_name}_latest.json")
         if not file_path.exists():
             return None
 
         with open(file_path) as f:
             data = json.load(f)
 
-        demos = [Demo(**d) for d in data.get("demos", [])]
+        demos = []
+        for d in data.get("demos", []):
+            if not isinstance(d, dict):
+                raise ValueError("Demo entry must be an object")
+            demo_data = {k: v for k, v in d.items() if k in Demo.__dataclass_fields__}
+            demos.append(Demo(**demo_data))
         return OptimizedPrompt(
             base_prompt=data["base_prompt"],
             demos=demos,

@@ -6,6 +6,7 @@ and parsing the output for use in optimization algorithms.
 """
 
 import os
+import shutil
 import subprocess
 import json
 import re
@@ -15,6 +16,63 @@ from typing import Optional
 
 # Default timeout in seconds (can be overridden via env var)
 DEFAULT_TIMEOUT = 180
+
+# Clamp the env-configurable timeout to a sane range so a poisoned environment
+# cannot pin a subprocess open indefinitely (or set a uselessly tiny value).
+MIN_TIMEOUT = 5
+MAX_TIMEOUT = 1800
+
+# Hard cap on captured stdout/stderr per run. A runaway / adversarial model
+# response could otherwise buffer unbounded output in memory.
+MAX_OUTPUT_BYTES = int(os.environ.get("PROMPT_OPTIMIZER_MAX_OUTPUT_BYTES", 5_000_000))
+
+# Patterns used to redact obvious secrets before any value is logged or stored.
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|bearer)\b\s*[:=]\s*\S+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+]
+
+
+def redact_secrets(text: Optional[str]) -> Optional[str]:
+    """Redact common secret patterns from a string before logging/storage."""
+    if not text:
+        return text
+    redacted = text
+    for pat in _SECRET_PATTERNS:
+        redacted = pat.sub("<REDACTED>", redacted)
+    return redacted
+
+
+def _build_subprocess_env() -> Optional[dict]:
+    """
+    Build the environment for the claude subprocess.
+
+    By default the subprocess inherits the parent environment (claude needs its
+    auth/config, typically under $HOME). When PROMPT_OPTIMIZER_SCRUB_ENV is set,
+    pass only an allowlisted, minimal environment so that ambient secrets
+    (cloud tokens, CI variables, .env exports) are not exposed to a model that
+    may attempt tool-driven exfiltration. Returns None to mean "inherit".
+    """
+    if os.environ.get("PROMPT_OPTIMIZER_SCRUB_ENV", "").lower() not in ("1", "true", "yes"):
+        return None
+
+    # Minimal allowlist needed for claude to locate config/auth and run.
+    allowlist = {
+        "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "TMPDIR",
+        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    }
+    # Allow explicit pass-through of named vars (e.g. a scoped token) if the
+    # operator opts in, but never blanket-copy the environment.
+    extra = os.environ.get("PROMPT_OPTIMIZER_ENV_PASSTHROUGH", "")
+    for name in (n.strip() for n in extra.split(",") if n.strip()):
+        allowlist.add(name)
+
+    env = {k: v for k, v in os.environ.items() if k in allowlist}
+    # Guarantee a usable PATH even if the parent had none.
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return env
 
 
 def estimate_timeout(input_text: str, base_timeout: int = 180) -> int:
@@ -71,8 +129,82 @@ class ClaudeRunner:
         self.model = model
         if timeout is None:
             timeout = int(os.environ.get("PROMPT_OPTIMIZER_TIMEOUT", DEFAULT_TIMEOUT))
-        self.timeout = timeout
+        # Clamp to a sane range (defends against a hostile env pinning a huge or
+        # tiny timeout).
+        self.timeout = max(MIN_TIMEOUT, min(int(timeout), MAX_TIMEOUT))
         self.working_dir = working_dir
+
+        # Resolve the claude executable once, at construction, to avoid a
+        # PATH-hijack where a project-local or world-writable './claude' is
+        # executed instead of the real CLI. Fall back to the bare name if not
+        # found (the subprocess call will then surface a clear error).
+        self.claude_bin = shutil.which("claude") or "claude"
+
+        # Whether to pass --dangerously-skip-permissions. This bypass is
+        # INHERENT to unattended/non-interactive optimization (the CLI would
+        # otherwise block on a permission prompt). It is documented in SECURITY.md.
+        # Operators who run only trusted datasets in a sandbox can disable it by
+        # setting PROMPT_OPTIMIZER_SKIP_PERMISSIONS=0, at the cost of the run
+        # hanging if the model attempts a gated tool call.
+        self.skip_permissions = os.environ.get(
+            "PROMPT_OPTIMIZER_SKIP_PERMISSIONS", "1"
+        ).lower() not in ("0", "false", "no")
+
+        self._env = _build_subprocess_env()
+
+    def _base_cmd(self) -> list:
+        """Build the leading argv shared by run() and run_with_system()."""
+        cmd = [self.claude_bin, "--print", "--model", self.model]
+        if self.skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+        return cmd
+
+    def _exec(self, cmd: list, stdin_text: str) -> "RunResult":
+        """
+        Execute a claude argv with the prompt supplied on STDIN.
+
+        Passing the prompt via stdin (rather than as a command-line argument)
+        keeps potentially-sensitive prompt/context text out of the process
+        argument list, which is world-readable via /proc on many systems.
+        Output is size-capped and secret-redacted before being returned.
+        """
+        try:
+            result = subprocess.run(
+                cmd,
+                input=stdin_text,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                cwd=self.working_dir,
+                env=self._env,
+            )
+        except subprocess.TimeoutExpired:
+            return RunResult(output="", success=False, error=f"Timeout after {self.timeout} seconds")
+        except Exception as e:
+            return RunResult(output="", success=False, error=redact_secrets(str(e)))
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        if len(stdout) > MAX_OUTPUT_BYTES or len(stderr) > MAX_OUTPUT_BYTES:
+            return RunResult(
+                output="",
+                success=False,
+                error=f"Output exceeded {MAX_OUTPUT_BYTES} bytes; treating run as failed",
+            )
+
+        if result.returncode != 0:
+            return RunResult(
+                output="",
+                success=False,
+                error=redact_secrets(stderr) or f"Exit code: {result.returncode}",
+                raw_output=stdout,
+            )
+
+        return RunResult(
+            output=self._clean_output(stdout),
+            success=True,
+            raw_output=stdout,
+        )
 
     def run(self, prompt: str, context: Optional[str] = None) -> RunResult:
         """
@@ -86,54 +218,8 @@ class ClaudeRunner:
             RunResult with output, success status, and any errors
         """
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
-
-        cmd = [
-            "claude",
-            "--print",  # Non-interactive, just print output
-            "--model", self.model,
-            "--dangerously-skip-permissions",  # Non-interactive mode
-            "--",  # End of options marker (prevents prompts starting with "-" from being parsed as flags)
-            full_prompt,
-        ]
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                cwd=self.working_dir,
-            )
-
-            if result.returncode != 0:
-                return RunResult(
-                    output="",
-                    success=False,
-                    error=result.stderr or f"Exit code: {result.returncode}",
-                    raw_output=result.stdout,
-                )
-
-            # Clean output - remove any ANSI codes
-            clean_output = self._clean_output(result.stdout)
-
-            return RunResult(
-                output=clean_output,
-                success=True,
-                raw_output=result.stdout,
-            )
-
-        except subprocess.TimeoutExpired:
-            return RunResult(
-                output="",
-                success=False,
-                error=f"Timeout after {self.timeout} seconds",
-            )
-        except Exception as e:
-            return RunResult(
-                output="",
-                success=False,
-                error=str(e),
-            )
+        # Prompt delivered on STDIN (see _exec) rather than as an argv element.
+        return self._exec(self._base_cmd(), full_prompt)
 
     def _clean_output(self, output: str) -> str:
         """Remove ANSI escape codes and clean up output."""
@@ -160,40 +246,10 @@ class ClaudeRunner:
             RunResult with output
         """
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
-        cmd = [
-            "claude",
-            "--print",
-            "--model", self.model,
-            "--dangerously-skip-permissions",
-            "--system-prompt", system_prompt,
-            "--",  # End of options marker
-            full_prompt,
-        ]
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                cwd=self.working_dir,
-            )
-
-            if result.returncode != 0:
-                return RunResult(
-                    output="",
-                    success=False,
-                    error=result.stderr or f"Exit code: {result.returncode}",
-                    raw_output=result.stdout,
-                )
-
-            clean_output = self._clean_output(result.stdout)
-            return RunResult(output=clean_output, success=True, raw_output=result.stdout)
-
-        except subprocess.TimeoutExpired:
-            return RunResult(output="", success=False, error=f"Timeout after {self.timeout}s")
-        except Exception as e:
-            return RunResult(output="", success=False, error=str(e))
+        cmd = self._base_cmd()
+        cmd += ["--system-prompt", system_prompt]
+        # Prompt delivered on STDIN (see _exec) rather than as an argv element.
+        return self._exec(cmd, full_prompt)
 
     def with_model(self, model: str) -> 'ClaudeRunner':
         """

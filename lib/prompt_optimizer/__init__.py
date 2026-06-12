@@ -86,6 +86,11 @@ from .utils import (
     find_skill_path,
     load_prompt_file,
 )
+from .validation import (
+    validate_name,
+    contained_path,
+    ValidationError,
+)
 # Phase 6: Extractors, format instructions, and demo transformers
 from .extractors import (
     extract_tool_from_verbose,
@@ -109,7 +114,7 @@ from .demo_transformers import (
     TransformedDemo,
 )
 
-__version__ = "0.4.0"  # Bumped for Phase 6
+__version__ = "0.5.0"  # Security hardening (2026-06-11 review)
 __all__ = [
     "ClaudeRunner",
     "BootstrapFewShot",
@@ -172,6 +177,10 @@ __all__ = [
     "find_agent_path",
     "find_skill_path",
     "load_prompt_file",
+    # Validation
+    "validate_name",
+    "contained_path",
+    "ValidationError",
     # Phase 6: Extractors
     "extract_tool_from_verbose",
     "normalize_tool_name",

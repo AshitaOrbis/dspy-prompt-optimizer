@@ -10,13 +10,13 @@ Scores both outputs against expected and writes results to a JSONL file.
 """
 
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 from prompt_optimizer.metrics import plan_quality_match
+from prompt_optimizer.claude_runner import ClaudeRunner
 
 TRAINING_DATA = Path("datasets/plan-quality.jsonl")
 RESULTS_FILE = Path("tmp/ab-test-results-opus.jsonl")
@@ -79,21 +79,20 @@ Create a detailed plan with:
 
 
 def run_claude(prompt: str, model: str = MODEL) -> tuple:
-    """Run a prompt through Claude CLI."""
-    cmd = [
-        "claude", "--print", "--model", model,
-        "--dangerously-skip-permissions",
-        "--", prompt,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-        if result.returncode != 0:
-            return False, result.stderr or f"Exit code: {result.returncode}"
-        return True, result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return False, "TIMEOUT"
-    except Exception as e:
-        return False, str(e)
+    """
+    Run a prompt through the hardened ClaudeRunner.
+
+    Routing through ClaudeRunner (rather than a bespoke subprocess call) means
+    the prompt is delivered on STDIN instead of as a world-readable argv element,
+    the 'claude' binary is resolved via shutil.which (no PATH hijack), the
+    timeout is clamped, output is size-capped and secret-redacted, and the
+    --dangerously-skip-permissions bypass honors PROMPT_OPTIMIZER_SKIP_PERMISSIONS.
+    """
+    runner = ClaudeRunner(model=model, timeout=TIMEOUT)
+    result = runner.run(prompt)
+    if result.success:
+        return True, result.output.strip()
+    return False, result.error or "unknown error"
 
 
 def main():

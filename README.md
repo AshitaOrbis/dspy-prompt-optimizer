@@ -165,6 +165,21 @@ Deployed optimizations across 11 of 13 targets:
 | Performance Analysis | Bootstrap | +21% pattern recognition | Deployed |
 | Feature Implementation | Iterative | +11% completeness | Deployed |
 
+## Security
+
+This tool runs the Claude Code CLI non-interactively over your training data and
+treats model output as a signal to modify your agent/skill prompts. **Both the
+data and the output are untrusted input.** Run only trusted datasets, preferably
+in a secret-free sandbox.
+
+A security review hardened the optimizer against shell injection, path
+traversal, destructive deploys, secret leakage, and prompt-fence breakout. One
+risk is **inherent** and documented honestly rather than fake-fixed: batch
+operation requires `--dangerously-skip-permissions`, so adversarial training
+data can drive tool execution. See [`SECURITY.md`](SECURITY.md) for the full
+threat model, mitigations, and the environment variables that tighten the
+sandbox (`PROMPT_OPTIMIZER_SCRUB_ENV`, `PROMPT_OPTIMIZER_SKIP_PERMISSIONS`).
+
 ## License
 
 MIT
