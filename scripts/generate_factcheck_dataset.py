@@ -152,13 +152,15 @@ def generate_factcheck_via_codex(post_path: Path) -> str:
                     if name and "." not in name:
                         mcp_disable_args.extend(["-c", f"mcp_servers.{name}.enabled=false"])
 
-    # Use reasoning_effort=medium based on codex-timeout-investigation results:
-    # medium completes 137-283s even for 4K-word posts; xhigh always times out
-    # at 480s, high times out on large inputs.
+    # Use reasoning_effort=xhigh based on codex-quality-tradeoff findings:
+    # medium is fast (137-283s) but fabricates evidence to justify Verified
+    # verdicts; xhigh is slower (~730s on 2K-word posts) but critically
+    # verifies claims. Quality of gold-standard data matters more than speed
+    # for a dataset the Haiku student will imitate.
     cmd = [
         codex_bin, "exec", "--full-auto",
         "-c", 'model="gpt-5.4"',
-        "-c", 'model_reasoning_effort="medium"',
+        "-c", 'model_reasoning_effort="xhigh"',
         *mcp_disable_args,
         "--ephemeral", "-",
     ]
@@ -169,7 +171,7 @@ def generate_factcheck_via_codex(post_path: Path) -> str:
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=480,
+            timeout=1200,
         )
 
         if result.returncode != 0:
@@ -182,7 +184,7 @@ def generate_factcheck_via_codex(post_path: Path) -> str:
         return ansi_escape.sub('', result.stdout).strip()
 
     except subprocess.TimeoutExpired:
-        print(f"  TIMEOUT after 480s")
+        print(f"  TIMEOUT after 1200s")
         return ""
     except Exception as e:
         print(f"  EXCEPTION: {e}")

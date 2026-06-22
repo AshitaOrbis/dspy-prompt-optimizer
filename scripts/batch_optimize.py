@@ -719,7 +719,7 @@ def main():
                 # holdout data to get an apples-to-apples holdout comparison.
                 # (Previous versions compared new holdout vs old training
                 # avg_score — wrong scale, wrong metric.)
-                from prompt_optimizer.storage import DemoStorage, OptimizedPrompt, Demo
+                from prompt_optimizer.storage import OptimizedPrompt, Demo
                 with open(backup_path) as bf:
                     backup_data = gate_json.load(bf)
                 old_demos = [Demo(**d) for d in backup_data.get("demos", [])]
