@@ -191,11 +191,24 @@ def generate_factcheck_via_codex(post_path: Path) -> str:
         return ""
 
 
+# Retry tuning for the claude -p fallback. Under concurrent load (multiple
+# dataset-generation processes invoking `claude -p` at once) the CLI can return
+# a transient non-zero exit (e.g. session/quota contention) that succeeds on a
+# later attempt. Retry with exponential backoff rather than failing the post on
+# the first hiccup. Timeouts are NOT retried (they are not transient at this
+# scale) and neither is success.
+CLAUDE_MAX_ATTEMPTS = 3
+CLAUDE_BACKOFF_BASE = 5  # seconds: 5s, 10s, 20s between attempts
+
+
 def generate_factcheck_via_claude(post_path: Path) -> str:
     """Fallback: generate factcheck using claude -p --model opus.
 
     Used when Codex times out or fails. Uses 600s timeout (more headroom
     than Codex 480s) since we know Claude handles large prompts reliably.
+
+    Retries on transient non-zero exits with exponential backoff, since a
+    `claude returned 1` under concurrent load usually clears on a retry.
     """
     post_content = post_path.read_text()
     prompt = FACTCHECK_PROMPT.format(post_content=post_content)
@@ -203,26 +216,40 @@ def generate_factcheck_via_claude(post_path: Path) -> str:
     env = {k: v for k, v in os.environ.items()}
     env.pop("CLAUDECODE", None)  # avoid nested-session error
 
-    try:
-        result = subprocess.run(
-            ["claude", "-p", "--model", "opus", "--max-turns", "1"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=env,
-        )
-        if result.returncode != 0:
-            print(f"  ERROR: claude returned {result.returncode}: {result.stderr[:300]}")
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    for attempt in range(1, CLAUDE_MAX_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", "opus", "--max-turns", "1"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                env=env,
+            )
+            if result.returncode != 0:
+                print(
+                    f"  ERROR: claude returned {result.returncode} "
+                    f"(attempt {attempt}/{CLAUDE_MAX_ATTEMPTS}): "
+                    f"{result.stderr[:300]}"
+                )
+                if attempt < CLAUDE_MAX_ATTEMPTS:
+                    backoff = CLAUDE_BACKOFF_BASE * (2 ** (attempt - 1))
+                    print(f"  Retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    continue
+                return ""
+            return ansi_escape.sub('', result.stdout).strip()
+        except subprocess.TimeoutExpired:
+            # Timeouts are not transient contention; don't burn retries on them.
+            print(f"  TIMEOUT after 600s (claude fallback)")
             return ""
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        return ansi_escape.sub('', result.stdout).strip()
-    except subprocess.TimeoutExpired:
-        print(f"  TIMEOUT after 600s (claude fallback)")
-        return ""
-    except Exception as e:
-        print(f"  EXCEPTION (claude fallback): {e}")
-        return ""
+        except Exception as e:
+            print(f"  EXCEPTION (claude fallback): {e}")
+            return ""
+
+    return ""
 
 
 def validate_factcheck(report: str, slug: str) -> bool:
