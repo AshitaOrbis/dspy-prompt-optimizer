@@ -7,7 +7,9 @@ with BootstrapFewShot.optimize().
 
 CLI invocations:
   - codex exec: passes prompt via stdin (large prompts break as CLI args)
-  - gemini -p: passes prompt via stdin piped to the -p flag
+  - agy -p: passes the prompt via the -p flag with stdin closed (the standalone
+    `gemini` CLI is deprecated — its personal OAuth tier is no longer eligible,
+    so Gemini access now goes through the Antigravity `agy` agentic CLI)
   - claude --print: existing ClaudeRunner handles this
 """
 
@@ -162,64 +164,73 @@ class CodexModelRunner(ModelRunner):
 
 class GeminiModelRunner(ModelRunner):
     """
-    Runner for Gemini 3.1 Pro via Gemini CLI.
+    Runner for Gemini 3.1 Pro via the Antigravity `agy` agentic CLI.
 
-    Uses `gemini -p` for non-interactive mode. Writes prompt to a temp file
-    and passes via stdin to handle large prompts.
+    The standalone `gemini` CLI is deprecated (its personal OAuth tier is no
+    longer eligible), so Gemini access now goes through `agy`. Uses `agy -p`
+    for non-interactive print mode with stdin closed (the prompt is passed via
+    the -p flag; agy has no stdin-append mode).
     """
 
     def __init__(
         self,
-        model: Optional[str] = None,
+        model: str = "gemini-3.1-pro",
         timeout: int = 480,
     ):
-        # Default None = use gemini CLI's built-in default (avoids capacity
-        # issues with explicitly requesting gemini-3.1-pro-preview)
+        # Default to gemini-3.1-pro. The old gemini-CLI runner defaulted to None
+        # to dodge a capacity issue when explicitly requesting
+        # gemini-3.1-pro-preview; that no longer applies on agy, which accepts
+        # the stable "gemini-3.1-pro" id.
         self.model = model
         self.timeout = timeout
-        self._binary = self._find_gemini_binary()
+        self._binary = self._find_agy_binary()
 
     @staticmethod
-    def _find_gemini_binary() -> str:
-        """Find the gemini binary."""
-        found = shutil.which("gemini")
+    def _find_agy_binary() -> str:
+        """Find the agy binary."""
+        found = shutil.which("agy")
         if found:
             return found
 
         home = os.path.expanduser("~")
+        candidate = os.path.join(home, ".local/bin/agy")
+        if os.path.isfile(candidate):
+            return candidate
+
         nvm_dir = os.path.join(home, ".nvm/versions/node")
         if os.path.isdir(nvm_dir):
             for d in sorted(os.listdir(nvm_dir), reverse=True):
-                candidate = os.path.join(nvm_dir, d, "bin/gemini")
+                candidate = os.path.join(nvm_dir, d, "bin/agy")
                 if os.path.isfile(candidate):
                     return candidate
 
-        return "gemini"
+        return "agy"
 
     def run(self, prompt: str, context: Optional[str] = None) -> RunResult:
-        """Run prompt through Gemini CLI.
+        """Run prompt through the agy CLI.
 
-        Pipes the prompt via stdin. The -p flag tells gemini to run
-        non-interactively; stdin content is appended to the prompt.
+        agy has no stdin-append mode, so the full prompt is passed via -p with
+        stdin closed (input="") to keep the run non-interactive.
         """
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
 
-        # Pass a short -p flag; pipe the actual content via stdin.
-        # Gemini CLI docs: "Appended to input on stdin (if any)"
+        # agy print mode: --dangerously-skip-permissions auto-approves any tool
+        # calls so the run never blocks on a permission prompt. --print-timeout
+        # governs agy's own wait; keep it just under our hard timeout.
         cmd = [
             self._binary,
-            "-p", "Review the following document:",
-            "--yolo",
+            "--dangerously-skip-permissions",
+            "--model", self.model,
+            "--print-timeout", f"{max(self.timeout - 30, 30)}s",
+            "-p", full_prompt,
         ]
-        if self.model:
-            cmd.extend(["-m", self.model])
 
         env = {k: v for k, v in os.environ.items()}
 
         try:
             result = subprocess.run(
                 cmd,
-                input=full_prompt,
+                input="",  # close stdin so agy stays non-interactive
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
@@ -256,21 +267,20 @@ class GeminiModelRunner(ModelRunner):
 
     @staticmethod
     def _clean_output(output: str) -> str:
-        """Remove ANSI codes and strip Gemini CLI preamble lines.
+        """Remove ANSI codes and strip agy CLI preamble lines.
 
-        Gemini CLI emits headers like "YOLO mode is enabled..." and
-        "Loaded cached credentials." to stdout before the actual model
-        output. These contaminate parsed responses, so strip any
-        preamble lines that match known patterns.
+        agy print mode may emit credential/model banner lines to stdout
+        before the actual model output. These contaminate parsed responses,
+        so strip any leading lines that match known patterns.
         """
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         cleaned = ansi_escape.sub('', output)
 
         preamble_patterns = (
-            "YOLO mode",
             "Loaded cached credentials",
             "Data collection is disabled",
             "Using model:",
+            "Auto-approve",
         )
         lines = cleaned.splitlines()
         start = 0
