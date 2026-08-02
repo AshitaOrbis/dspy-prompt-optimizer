@@ -606,8 +606,11 @@ def pre_flight_holdout_check(
             if verbose:
                 print(f"  [new {i+1}/{len(holdout_data)}] Score: {score:.3f}")
         else:
+            # A failed evaluation scores 0 rather than vanishing from the mean —
+            # dropping it silently inflates the average of whatever remains.
+            new_scores.append(0.0)
             if verbose:
-                print(f"  [new {i+1}/{len(holdout_data)}] FAILED: {result.error}")
+                print(f"  [new {i+1}/{len(holdout_data)}] FAILED (scored 0.0): {result.error}")
 
     new_score = sum(new_scores) / len(new_scores) if new_scores else 0.0
 
@@ -627,8 +630,10 @@ def pre_flight_holdout_check(
                 if verbose:
                     print(f"  [existing {i+1}/{len(holdout_data)}] Score: {score:.3f}")
             else:
+                # Same rule as the new arm: failures score 0, symmetrically.
+                existing_scores.append(0.0)
                 if verbose:
-                    print(f"  [existing {i+1}/{len(holdout_data)}] FAILED: {result.error}")
+                    print(f"  [existing {i+1}/{len(holdout_data)}] FAILED (scored 0.0): {result.error}")
 
         existing_score = sum(existing_scores) / len(existing_scores) if existing_scores else 0.0
 
@@ -641,17 +646,17 @@ def pre_flight_holdout_check(
             print(f"  Decision: DEPLOY (first optimization)")
     else:
         improvement = new_score - existing_score
-        should_deploy = improvement >= -min_improvement  # deploy if at least as good
+        should_deploy = improvement >= min_improvement
 
         if verbose:
             print(f"\n  Existing score: {existing_score:.3f}")
             print(f"  New score:      {new_score:.3f}")
             print(f"  Improvement:    {improvement:+.3f}")
-            print(f"  Min required:   {-min_improvement:+.3f}")
+            print(f"  Min required:   {min_improvement:+.3f}")
             if should_deploy:
                 print(f"  Decision: DEPLOY (improvement >= threshold)")
             else:
-                print(f"  Decision: SKIP (regression detected, keeping existing)")
+                print(f"  Decision: SKIP (improvement below threshold, keeping existing)")
 
     return should_deploy, new_score, existing_score
 

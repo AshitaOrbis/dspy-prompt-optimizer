@@ -42,6 +42,35 @@ def make_holdout_data():
     ]
 
 
+def run_gate_with_scores(new_score, existing_score, min_improvement, verbose=False):
+    """Run the gate with deterministic new and existing holdout scores."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = DemoStorage(storage_dir=tmpdir)
+        storage.save_optimized_prompt("test-agent", make_optimized_prompt())
+
+        runner = MagicMock()
+        runner.run.side_effect = [
+            FakeRunResult(output="new output", success=True),
+            FakeRunResult(output="new output", success=True),
+            FakeRunResult(output="existing output", success=True),
+            FakeRunResult(output="existing output", success=True),
+        ]
+
+        def mock_metric(expected, actual):
+            return new_score if actual == "new output" else existing_score
+
+        return pre_flight_holdout_check(
+            agent_name="test-agent",
+            new_optimized=make_optimized_prompt(),
+            holdout_data=make_holdout_data(),
+            metric_fn=mock_metric,
+            runner=runner,
+            storage=storage,
+            min_improvement=min_improvement,
+            verbose=verbose,
+        )
+
+
 def test_gate_passes_when_new_is_better():
     """Gate should return should_deploy=True when new score beats existing."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -129,6 +158,49 @@ def test_gate_blocks_when_new_is_worse():
         assert existing_score == 0.8
 
 
+def test_gate_blocks_small_regression_when_positive_improvement_required(capsys):
+    """A positive minimum improvement must not permit a small regression."""
+    should_deploy, new_score, existing_score = run_gate_with_scores(
+        new_score=0.46,
+        existing_score=0.50,
+        min_improvement=0.05,
+        verbose=True,
+    )
+
+    output = capsys.readouterr().out
+    assert should_deploy is False
+    assert new_score == 0.46
+    assert existing_score == 0.50
+    assert "Min required:   +0.050" in output
+    assert "Decision: SKIP" in output
+
+
+def test_gate_blocks_improvement_smaller_than_positive_margin():
+    """An improvement below the required positive margin must not deploy."""
+    should_deploy, new_score, existing_score = run_gate_with_scores(
+        new_score=0.53,
+        existing_score=0.50,
+        min_improvement=0.05,
+    )
+
+    assert should_deploy is False
+    assert new_score == 0.53
+    assert existing_score == 0.50
+
+
+def test_gate_deploys_when_improvement_clears_positive_margin():
+    """An improvement above the required positive margin must deploy."""
+    should_deploy, new_score, existing_score = run_gate_with_scores(
+        new_score=0.56,
+        existing_score=0.50,
+        min_improvement=0.05,
+    )
+
+    assert should_deploy is True
+    assert new_score == 0.56
+    assert existing_score == 0.50
+
+
 def test_gate_auto_passes_first_optimization():
     """Gate should always deploy when there's no existing optimization."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -160,6 +232,41 @@ def test_gate_auto_passes_first_optimization():
         assert existing_score is None
 
 
+def test_failed_evaluations_score_zero_not_dropped():
+    """A failed run must pull the mean down, not vanish from it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = DemoStorage(storage_dir=tmpdir)
+        storage.save_optimized_prompt("test-agent", make_optimized_prompt())
+
+        # New arm: one success (0.9) + one failure -> mean 0.45, not 0.9.
+        # Existing arm: two successes at 0.5.
+        runner = MagicMock()
+        runner.run.side_effect = [
+            FakeRunResult(output="new output", success=True),
+            FakeRunResult(output="", success=False, error="runner crashed"),
+            FakeRunResult(output="existing output", success=True),
+            FakeRunResult(output="existing output", success=True),
+        ]
+
+        def mock_metric(expected, actual):
+            return 0.9 if actual == "new output" else 0.5
+
+        should_deploy, new_score, existing_score = pre_flight_holdout_check(
+            agent_name="test-agent",
+            new_optimized=make_optimized_prompt(),
+            holdout_data=make_holdout_data(),
+            metric_fn=mock_metric,
+            runner=runner,
+            storage=storage,
+            min_improvement=0.0,
+            verbose=False,
+        )
+
+        assert new_score == 0.45, "failure must count as 0.0 in the mean"
+        assert existing_score == 0.5
+        assert should_deploy is False, "a failure-dragged mean below existing must not deploy"
+
+
 if __name__ == "__main__":
     test_gate_passes_when_new_is_better()
     print("PASS: test_gate_passes_when_new_is_better")
@@ -169,5 +276,8 @@ if __name__ == "__main__":
 
     test_gate_auto_passes_first_optimization()
     print("PASS: test_gate_auto_passes_first_optimization")
+
+    test_failed_evaluations_score_zero_not_dropped()
+    print("PASS: test_failed_evaluations_score_zero_not_dropped")
 
     print("\nAll holdout gate tests passed!")
