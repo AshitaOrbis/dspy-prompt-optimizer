@@ -312,7 +312,7 @@ def get_runner_for_model(model: str) -> ModelRunner:
     The same pattern is used in the Psyche benchmark (`benchmark/run_eval.py`).
 
     Args:
-        model: One of "gpt", "gemini", "opus" (alias), or "opus-4-7" (pinned).
+        model: One of "gpt", "gemini", "opus"/"opus-4-7", or "fable"/"fable-5".
 
     Returns:
         Appropriate ModelRunner instance.
@@ -329,8 +329,15 @@ def get_runner_for_model(model: str) -> ModelRunner:
         # Pinned Opus 4.7 for longitudinal comparison. The CLI accepts full
         # model IDs as well as aliases.
         return ClaudeRunner(model="claude-opus-4-7", timeout=480)
+    elif model == "fable":
+        # CLI alias — tracks the current Fable (Mythos-class) generation.
+        # Verified `claude -p --model fable` is accepted (2026-07-06).
+        return ClaudeRunner(model="fable", timeout=480)
+    elif model == "fable-5":
+        # Pinned Fable 5 for longitudinal comparison.
+        return ClaudeRunner(model="claude-fable-5", timeout=480)
     else:
         raise ValueError(
             f"Unknown model: {model}. "
-            f"Expected 'gpt', 'gemini', 'opus', or 'opus-4-7'."
+            f"Expected 'gpt', 'gemini', 'opus', 'opus-4-7', 'fable', or 'fable-5'."
         )

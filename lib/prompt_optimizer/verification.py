@@ -107,10 +107,20 @@ class VerificationSuite:
                     # Validate structure
                     if not isinstance(data, dict):
                         raise ValueError("Baseline scores must be a dict")
-                    for k, v in data.items():
-                        if not isinstance(v, (int, float)):
-                            raise ValueError(f"Score for '{k}' must be numeric, got {type(v).__name__}")
-                    self._baseline_scores = data
+                    # Keep only numeric entries. Non-numeric values (e.g. a
+                    # documentation "<target>_note" string) are metadata, not
+                    # scores — skip them with a warning instead of rejecting the
+                    # whole file. Rejecting made _baseline_scores = {}, which
+                    # silently gave every regression check a 0.000 baseline
+                    # (fail-open: any score "passed"). Bug found 2026-07-06 by
+                    # the code-reviewer re-baseline run.
+                    scores = {}
+                    for k, val in data.items():
+                        if isinstance(val, bool) or not isinstance(val, (int, float)):
+                            print(f"Note: skipping non-numeric baseline entry '{k}'")
+                            continue
+                        scores[k] = val
+                    self._baseline_scores = scores
             except (json.JSONDecodeError, ValueError) as e:
                 print(f"Warning: Could not load baseline scores: {e}")
                 self._baseline_scores = {}

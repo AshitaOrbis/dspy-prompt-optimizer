@@ -34,3 +34,12 @@ status.json
 
 # Logs
 *.log
+
+# Node (added 2026-07-25 housekeeping sweep — src/node_modules had 8,608 files
+# staged by a naive `git add -A`)
+node_modules/
+
+# Scratch files from optimizer runs
+temp_*.md
+temp_*.json
+temp_*.txt

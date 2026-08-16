@@ -329,7 +329,7 @@ def main():
     parser.add_argument(
         "--model",
         default="haiku",
-        choices=["sonnet", "opus", "haiku"],
+        choices=["sonnet", "opus", "haiku", "fable"],
         help="Model to use for evaluation (default: haiku)",
     )
     parser.add_argument(

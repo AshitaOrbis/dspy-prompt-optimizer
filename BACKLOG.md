@@ -53,3 +53,17 @@ These are the broader changes that would lift the whole campaign rather than fix
 - `reports/april-2026-round2.md` — most recent campaign round, contains "Remaining Work" section that this backlog supersedes
 - `reports/regression-investigation.md` — original code-reviewer regression analysis
 - `reports/dspy-optimization-summary.md` — campaign summary across all rounds
+
+## 2026-07-16 — deploy script corrupts agents with markdown-heading demos (found during code-reviewer promotion)
+
+`scripts/deploy_optimized_prompts.py` `inject_demos_to_agent()` locates the end of the
+old `## Few-Shot Examples` section via `rest.find("\n## ")`. When a demo's fenced
+**Output:** block itself contains a `## ` heading (code-reviewer's do: `## Code Review
+Summary`), the heuristic stops at the nested heading instead of the real next section —
+a naive run leaves stale tail-fragments of the old examples duplicated in the file.
+Fix: anchor on the actual next top-level section (track fence state, or require the
+known following heading). The 2026-07-16 promotion was done manually anchored on
+`## Guidelines` (see ~/.claude/agents/code-reviewer.md.bak-2026-07-16 for the pre-state);
+the script itself is still buggy and will corrupt any future promotion run verbatim.
+
+- **2026-08-02 (bq-019):** `tests/test_model_runners.py` has 2 pre-existing failures (gemini preamble-stripping expectations) on BOTH the workspace and public lines, present before and after the deployment-gate fix (verified at HEAD~1). Root cause likely the gemini→agy preamble drift; fix the stripper or the fixtures.
