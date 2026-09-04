@@ -23,13 +23,13 @@ from prompt_optimizer import BootstrapFewShot, ClaudeRunner
 
 optimizer = BootstrapFewShot(
     runner=ClaudeRunner(model="haiku"),
-    max_demos=5,
-    score_threshold=0.7
+    max_demos=5
 )
 result = optimizer.optimize(
-    prompt="Your agent/skill prompt",
+    base_prompt="Your agent/skill prompt",
     training_data=examples,
-    metric_fn=your_metric
+    metric_fn=your_metric,
+    threshold=0.7
 )
 ```
 
@@ -38,27 +38,38 @@ result = optimizer.optimize(
 Instruction-level optimization. Generate prompt variants through mutations (paraphrase, elaborate, simplify, extend), evaluate each on training data, pick the winner.
 
 ```python
-from prompt_optimizer import COPROOptimizer
+from prompt_optimizer import COPROOptimizer, ClaudeRunner
 
 optimizer = COPROOptimizer(
     runner=ClaudeRunner(model="haiku"),
-    mutations=["paraphrase", "elaborate", "simplify"],
-    candidates_per_round=3
+    n_variants=3,
+    eval_subset_size=10
+)
+result = optimizer.optimize(
+    base_prompt="Your agent/skill prompt",
+    training_data=examples,
+    metric_fn=your_metric
 )
 ```
 
 ### Iterative Optimization
 
-Combines COPRO + Bootstrap across multiple rounds with cross-validation and dropout regularization. The most thorough approach.
+Runs Bootstrap across multiple rounds, expands the training set with synthetic examples, and stops when scores converge.
 
 ```python
-from prompt_optimizer import IterativeOptimizer
+from prompt_optimizer import IterativeOptimizer, ClaudeRunner
 
 optimizer = IterativeOptimizer(
     runner=ClaudeRunner(model="haiku"),
-    rounds=3,
-    cv_folds=3,
-    dropout=0.3
+    max_rounds=3,
+    convergence_threshold=0.01
+)
+result = optimizer.optimize(
+    base_prompt="Your agent/skill prompt",
+    training_data=examples,
+    metric_fn=your_metric,
+    threshold=0.7,
+    max_demos=5
 )
 ```
 

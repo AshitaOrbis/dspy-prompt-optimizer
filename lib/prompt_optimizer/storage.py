@@ -59,6 +59,7 @@ class OptimizedPrompt:
 
     def to_markdown(self) -> str:
         """Convert to markdown format suitable for CLAUDE.md or skills."""
+        base_fence = _safe_fence(self.base_prompt)
         lines = [
             f"# Optimized Prompt",
             f"",
@@ -69,9 +70,9 @@ class OptimizedPrompt:
             f"",
             f"## Base Prompt",
             f"",
-            f"```",
+            base_fence,
             self.base_prompt,
-            f"```",
+            base_fence,
             f"",
             f"## Few-Shot Examples",
             f"",

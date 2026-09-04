@@ -13,6 +13,7 @@
 #   --dropout       Example dropout rate (default: 0.2)
 #   --output-dir    Output directory (default: optimized-prompts)
 #   --datasets-dir  Datasets directory (default: datasets)
+#   --allow-unverified  Deprecated compatibility flag; never marks ungated work complete
 #   --foreground    Run in foreground instead of background
 #
 # Status tracking:
@@ -32,6 +33,7 @@ DROPOUT=0.2
 OUTPUT_DIR="optimized-prompts"
 DATASETS_DIR="datasets"
 FOREGROUND=false
+ALLOW_UNVERIFIED=false
 
 # Target -> dataset mapping
 declare -A DATASET_MAP=(
@@ -53,28 +55,6 @@ declare -A DATASET_MAP=(
     # Tier 3
     ["writing-review"]="writing-reviews"
     ["session-handoff"]="session-handoffs"
-)
-
-# Target -> metric mapping
-declare -A METRIC_MAP=(
-    ["mcp-search-framework"]="routing"
-    ["mgrep-guide"]="binary_decision"
-    ["advanced-tool-use"]="tool_tier"
-    ["code-reviewer"]="issue_severity"
-    ["test-writer"]="test_coverage"
-    ["security-auditor"]="security_cwe"
-    ["performance-analyzer"]="complexity"
-    ["capability-evaluator"]="evaluation_score"
-    # Tier 1
-    ["pr-preparer"]="pr_quality"
-    ["refactoring-advisor"]="refactoring"
-    # Tier 2
-    ["capability-discoverer"]="discovery_quality"
-    ["fact-checker"]="fact_check_quality"
-    ["web-researcher"]="research_quality"
-    # Tier 3
-    ["writing-review"]="writing_review_quality"
-    ["session-handoff"]="handoff_quality"
 )
 
 # Target type (agent or skill)
@@ -137,6 +117,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --foreground)
             FOREGROUND=true
+            shift
+            ;;
+        --allow-unverified)
+            ALLOW_UNVERIFIED=true
             shift
             ;;
         -h|--help)
@@ -229,7 +213,8 @@ write_status() {
     local progress="$2"
     local completed=("${!3}")
     local failed=("${!4}")
-    local scores="${5:-{}}"
+    local unverified=("${!5}")
+    local scores="${6:-{}}"
 
     # Validate scores is well-formed JSON; fall back to {} if not.
     if ! echo "$scores" | jq -e . >/dev/null 2>&1; then
@@ -239,10 +224,11 @@ write_status() {
     local targets_arr
     IFS=',' read -ra targets_arr <<< "$TARGETS"
 
-    local targets_json completed_json failed_json
+    local targets_json completed_json failed_json unverified_json
     targets_json="$(to_json_array "${targets_arr[@]}")"
     completed_json="$(to_json_array ${completed[@]+"${completed[@]}"})"
     failed_json="$(to_json_array ${failed[@]+"${failed[@]}"})"
+    unverified_json="$(to_json_array ${unverified[@]+"${unverified[@]}"})"
 
     jq -n \
         --arg started "$(date -Iseconds)" \
@@ -252,11 +238,13 @@ write_status() {
         --argjson targets "$targets_json" \
         --argjson completed "$completed_json" \
         --argjson failed "$failed_json" \
+        --argjson unverified "$unverified_json" \
         '{
             started: $started,
             targets: $targets,
             completed: $completed,
             failed: $failed,
+            unverified: $unverified,
             current: $current,
             progress: $progress,
             scores: $scores
@@ -271,6 +259,7 @@ run_optimization() {
     local total=${#targets_arr[@]}
     local completed=()
     local failed=()
+    local unverified=()
     local scores="{}"
     local idx=0
 
@@ -284,7 +273,7 @@ run_optimization() {
 
     for target in "${targets_arr[@]}"; do
         idx=$((idx + 1))
-        write_status "$target" "$idx/$total" completed[@] failed[@] "$scores"
+        write_status "$target" "$idx/$total" completed[@] failed[@] unverified[@] "$scores"
 
         echo ""
         echo "======================================"
@@ -296,15 +285,21 @@ run_optimization() {
         local dataset_path="$DATASETS_DIR/${dataset}.jsonl"
         local holdout_path="$DATASETS_DIR/${dataset}-holdout.jsonl"
 
-        # Get metric
-        local metric="${METRIC_MAP[$target]:-score_similarity}"
-
         # Get target type
         local target_type="${TARGET_TYPE[$target]:-agent}"
 
         if [[ ! -f "$dataset_path" ]]; then
             echo "[ERROR] Dataset not found: $dataset_path"
             failed+=("$target")
+            continue
+        fi
+
+        if [[ ! -f "$holdout_path" ]]; then
+            echo "[UNVERIFIED] Holdout not found: $holdout_path"
+            if [[ "$ALLOW_UNVERIFIED" == "true" ]]; then
+                echo "[UNVERIFIED] --allow-unverified cannot bypass the promotion gate"
+            fi
+            unverified+=("$target")
             continue
         fi
 
@@ -322,6 +317,12 @@ run_optimization() {
         cmd+=(--model "$MODEL")
         cmd+=(--algorithm "$ALGORITHM")
         cmd+=(--threshold 0.6)
+        if [[ -f "$holdout_path" ]]; then
+            # The batch CLI stages the candidate and performs the binding gate.
+            # Its exit status therefore covers optimization and validation.
+            cmd+=(--holdout-gate)
+            cmd+=(--holdout-dir "$DATASETS_DIR")
+        fi
 
         echo "Command: ${cmd[*]}"
         echo ""
@@ -329,32 +330,8 @@ run_optimization() {
         # Run optimization
         if "${cmd[@]}"; then
             echo ""
-            echo "[SUCCESS] Optimized: $target"
+            echo "[SUCCESS] Optimized and holdout-gated: $target"
             completed+=("$target")
-
-            # Run holdout validation if available
-            if [[ -f "$holdout_path" ]]; then
-                echo "[$(date -Iseconds)] Running holdout validation..."
-
-                local holdout_cmd=("$PYTHON_BIN" "$SCRIPT_DIR/verify_optimizations.py")
-
-                # Use --skill or --agent based on target type
-                if [[ "$target_type" == "skill" ]]; then
-                    holdout_cmd+=(--skill "$target")
-                else
-                    holdout_cmd+=(--agent "$target")
-                fi
-
-                holdout_cmd+=(--holdout "$holdout_path")
-                holdout_cmd+=(--model "haiku")  # Use cheaper model for validation
-                holdout_cmd+=(--pass-threshold 0.5)
-
-                if "${holdout_cmd[@]}" 2>&1 | tee -a "$OUTPUT_DIR/optimization.log"; then
-                    echo "[SUCCESS] Holdout validation passed"
-                else
-                    echo "[WARNING] Holdout validation had issues"
-                fi
-            fi
         else
             echo ""
             echo "[FAILED] Could not optimize: $target"
@@ -362,20 +339,38 @@ run_optimization() {
         fi
     done
 
-    # Final status
-    write_status "complete" "$total/$total" completed[@] failed[@] "$scores"
+    # Final status: reserve "complete" and OPTIMIZATION_COMPLETE for a fully
+    # gated run. Failed and unverified targets get explicit terminal states.
+    local final_state final_label
+    if [[ ${#failed[@]} -eq 0 && ${#unverified[@]} -eq 0 ]]; then
+        final_state="complete"
+        final_label="OPTIMIZATION COMPLETE"
+    elif [[ ${#completed[@]} -eq 0 && ${#failed[@]} -gt 0 ]]; then
+        final_state="failed"
+        final_label="OPTIMIZATION FAILED"
+    elif [[ ${#completed[@]} -eq 0 && ${#unverified[@]} -gt 0 ]]; then
+        final_state="unverified"
+        final_label="OPTIMIZATION UNVERIFIED"
+    else
+        final_state="partial"
+        final_label="OPTIMIZATION PARTIAL"
+    fi
+    write_status "$final_state" "$total/$total" completed[@] failed[@] unverified[@] "$scores"
 
     echo ""
     echo "======================================"
-    echo "[$(date -Iseconds)] OPTIMIZATION COMPLETE"
+    echo "[$(date -Iseconds)] $final_label"
     echo "======================================"
     echo "Completed: ${#completed[@]}/${total}"
     echo "Failed: ${#failed[@]}/${total}"
+    echo "Unverified: ${#unverified[@]}/${total}"
     echo ""
 
     # Terminal signal
-    if [[ ${#failed[@]} -eq 0 ]]; then
+    if [[ ${#failed[@]} -eq 0 && ${#unverified[@]} -eq 0 ]]; then
         echo "TERMINAL_SIGNAL: OPTIMIZATION_COMPLETE"
+    elif [[ ${#completed[@]} -eq 0 && ${#unverified[@]} -gt 0 && ${#failed[@]} -eq 0 ]]; then
+        echo "TERMINAL_SIGNAL: OPTIMIZATION_UNVERIFIED"
     elif [[ ${#completed[@]} -eq 0 ]]; then
         echo "TERMINAL_SIGNAL: OPTIMIZATION_FAILED"
     else
@@ -402,10 +397,12 @@ Generated: $(date -Iseconds)
 |--------|--------|-------|
 $(for t in "${completed[@]}"; do echo "| $t | ✅ Passed | Optimized |"; done)
 $(for t in "${failed[@]}"; do echo "| $t | ❌ Failed | See logs |"; done)
+$(for t in "${unverified[@]}"; do echo "| $t | ⚠️ Unverified | Missing holdout; not optimized |"; done)
 
 ## Summary
 - **Completed**: ${#completed[@]}/$total
 - **Failed**: ${#failed[@]}/$total
+- **Unverified**: ${#unverified[@]}/$total
 
 ## Next Steps
 $(if [[ ${#failed[@]} -gt 0 ]]; then echo "- Review failed targets in optimization.log"; fi)
@@ -415,6 +412,14 @@ EOF
 
     echo ""
     echo "Summary written to: $OUTPUT_DIR/summary.md"
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        return 1
+    fi
+    if [[ ${#unverified[@]} -gt 0 ]]; then
+        return 2
+    fi
+    return 0
 }
 
 # Run in background or foreground
@@ -444,6 +449,9 @@ else
         --output-dir "$OUTPUT_DIR"
         --datasets-dir "$DATASETS_DIR"
     )
+    if [[ "$ALLOW_UNVERIFIED" == "true" ]]; then
+        bg_cmd+=(--allow-unverified)
+    fi
     nohup "${bg_cmd[@]}" > "$OUTPUT_DIR/optimization.log" 2>&1 &
 
     echo $! > "$OUTPUT_DIR/pid"

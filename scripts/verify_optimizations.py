@@ -74,6 +74,7 @@ from prompt_optimizer import (
 )
 from prompt_optimizer.verification import (
     VerificationSuite,
+    VerificationStatus,
     generate_verification_report,
 )
 
@@ -305,6 +306,14 @@ def main():
         default=0.02,
         help="Maximum acceptable score drop for regression (default: 0.02)",
     )
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help=(
+            "Advisory mode: do not fail solely for missing, unreadable, or empty "
+            "holdout/baseline evidence. Evaluation failures and regressions still fail."
+        ),
+    )
 
     # Baseline management
     parser.add_argument(
@@ -386,25 +395,10 @@ def main():
 
     # Determine targets
     if args.all:
-        # Find all agents/skills with holdout data
-        targets = []
-        metric_fns = {}
-
-        for agent in AGENT_DATA_PATHS:
-            holdout_path = find_holdout_file(agent, holdout_dir)
-            if holdout_path.exists():
-                targets.append(agent)
-                metric_fns[agent] = get_metric_fn(agent)
-
-        for skill in SKILL_DATA_PATHS:
-            holdout_path = find_holdout_file(skill, holdout_dir)
-            if holdout_path.exists():
-                targets.append(skill)
-                metric_fns[skill] = get_metric_fn(skill)
-
-        if not targets:
-            print("No targets found with holdout data", file=sys.stderr)
-            sys.exit(1)
+        # --all requests every configured target. Missing evidence must remain
+        # visible in the report instead of silently shrinking this list.
+        targets = list(dict.fromkeys([*AGENT_DATA_PATHS, *SKILL_DATA_PATHS]))
+        metric_fns = {target: get_metric_fn(target) for target in targets}
 
         if verbose:
             print(f"Found {len(targets)} targets with holdout data")
@@ -423,6 +417,7 @@ def main():
             pass_threshold=args.pass_threshold,
             regression_threshold=args.regression_threshold,
             run_cross_validation=args.cross_validate,
+            check_regression=args.check_regression,
             k_folds=args.k,
             verbose=verbose,
             data_basenames=all_data_basenames,
@@ -435,8 +430,7 @@ def main():
         else:
             print("\n" + generate_verification_report(report))
 
-        # Exit with error if any failures
-        if report.summary.get('holdout_failed', 0) > 0 or report.summary.get('regressions', 0) > 0:
+        if report.has_blocking_failures(allow_missing=args.allow_missing):
             sys.exit(1)
 
     else:
@@ -451,29 +445,70 @@ def main():
             holdout_path = find_holdout_file(name, holdout_dir)
 
         if holdout_path.exists():
-            holdout_data = suite.load_holdout_data(holdout_path)
-            result = suite.run_holdout_evaluation(
-                agent_name=name,
-                holdout_data=holdout_data,
-                metric_fn=metric_fn,
-                pass_threshold=args.pass_threshold,
-                verbose=verbose,
-            )
+            try:
+                holdout_data = suite.load_holdout_data(holdout_path)
+            except (OSError, ValueError, KeyError) as exc:
+                print(f"Could not read holdout data at {holdout_path}: {exc}", file=sys.stderr)
+                if not args.allow_missing:
+                    sys.exit(1)
+                holdout_data = []
 
-            # Regression check
-            if args.check_regression:
-                suite.check_regression(
+            if not holdout_data:
+                if verbose:
+                    print(f"Holdout data is empty or unreadable at {holdout_path}")
+                if not args.allow_missing:
+                    sys.exit(1)
+                holdout_result = None
+            else:
+                holdout_result = suite.run_holdout_evaluation(
                     agent_name=name,
-                    new_score=result.holdout_score,
-                    regression_threshold=args.regression_threshold,
+                    holdout_data=holdout_data,
+                    metric_fn=metric_fn,
+                    pass_threshold=args.pass_threshold,
                     verbose=verbose,
                 )
 
-            if not result.passed:
-                sys.exit(1)
+            if holdout_result is not None:
+                status = getattr(holdout_result.status, "value", holdout_result.status)
+                if status in (
+                    VerificationStatus.FAIL.value,
+                    VerificationStatus.ERROR.value,
+                ):
+                    sys.exit(1)
+                if status == VerificationStatus.NOT_RUN.value:
+                    error_category = getattr(
+                        holdout_result, "error_category", None
+                    )
+                    if not (
+                        args.allow_missing and error_category == "evidence"
+                    ):
+                        sys.exit(1)
+
+                if args.check_regression:
+                    regression_result = suite.check_regression(
+                        agent_name=name,
+                        new_score=holdout_result.holdout_score,
+                        regression_threshold=args.regression_threshold,
+                        verbose=verbose,
+                    )
+                    regression_status = getattr(
+                        regression_result.status, "value", regression_result.status
+                    )
+                    if regression_result.regressed or regression_status == VerificationStatus.FAIL.value:
+                        sys.exit(1)
+                    if (
+                        regression_status
+                        == VerificationStatus.NOT_ASSESSABLE.value
+                        and args.allow_missing
+                    ):
+                        pass
+                    elif regression_status != VerificationStatus.PASS.value:
+                        sys.exit(1)
         else:
             if verbose:
                 print(f"No holdout data found at {holdout_path}")
+            if not args.allow_missing:
+                sys.exit(1)
 
         # Cross-validation
         if args.cross_validate:
@@ -494,6 +529,9 @@ def main():
                 k=args.k,
                 verbose=verbose,
             )
+            cv_status = getattr(cv_result.status, "value", cv_result.status)
+            if cv_status != VerificationStatus.PASS.value:
+                sys.exit(1)
 
 
 if __name__ == "__main__":

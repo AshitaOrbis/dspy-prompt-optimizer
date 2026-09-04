@@ -7,21 +7,25 @@ with BootstrapFewShot.optimize().
 
 CLI invocations:
   - codex exec: passes prompt via stdin (large prompts break as CLI args)
-  - agy -p: passes the prompt via the -p flag with stdin closed (the standalone
-    `gemini` CLI is deprecated — its personal OAuth tier is no longer eligible,
-    so Gemini access now goes through the Antigravity `agy` agentic CLI)
-  - claude --print: existing ClaudeRunner handles this
+  - agy --input-format=stream-json: passes the repository's provisional typed
+    prompt event via stdin. Local help confirms NDJSON transport, but the exact
+    live request envelope remains unverified (see SECURITY.md).
+  - claude --print: ClaudeRunner uses the same hardened subprocess primitive
 """
 
+import json
 import os
 import re
 import shutil
-import subprocess
-import tempfile
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from .claude_runner import RunResult
+from .claude_runner import (
+    RunResult,
+    permission_automation_enabled,
+    run_hardened_subprocess,
+    validate_timeout,
+)
 
 
 class ModelRunner(ABC):
@@ -48,7 +52,7 @@ class CodexModelRunner(ModelRunner):
         retry_delay: float = 2.0,
     ):
         self.model = model
-        self.timeout = timeout
+        self.timeout = validate_timeout(timeout)
         self.retry_delay = retry_delay
         self._binary = self._find_codex_binary()
 
@@ -104,9 +108,12 @@ class CodexModelRunner(ModelRunner):
         cmd = [
             self._binary,
             "exec",
-            "--full-auto",
             "-c", f'model="{self.model}"',
         ]
+        if permission_automation_enabled():
+            # Current Codex CLI's bounded approval automation. Unlike the old
+            # --full-auto flag, this retains the workspace-write sandbox.
+            cmd.append("--approve-for-me")
         for server_name in self._get_configured_mcp_servers():
             cmd.extend(["-c", f"mcp_servers.{server_name}.enabled=false"])
         cmd.extend([
@@ -114,45 +121,17 @@ class CodexModelRunner(ModelRunner):
             "-",  # Read prompt from stdin
         ])
 
-        env = {k: v for k, v in os.environ.items()}
-
-        try:
-            result = subprocess.run(
-                cmd,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                env=env,
-            )
-
-            if result.returncode != 0:
-                return RunResult(
-                    output="",
-                    success=False,
-                    error=result.stderr or f"Exit code: {result.returncode}",
-                    raw_output=result.stdout,
-                )
-
-            clean_output = self._clean_output(result.stdout)
-            return RunResult(
-                output=clean_output,
-                success=True,
-                raw_output=result.stdout,
-            )
-
-        except subprocess.TimeoutExpired:
-            return RunResult(
-                output="",
-                success=False,
-                error=f"Timeout after {self.timeout}s",
-            )
-        except Exception as e:
-            return RunResult(
-                output="",
-                success=False,
-                error=str(e),
-            )
+        result = run_hardened_subprocess(
+            cmd,
+            stdin_text=full_prompt,
+            timeout=self.timeout,
+            sensitive_values=tuple(
+                value for value in (full_prompt, prompt, context) if value
+            ),
+        )
+        if result.success:
+            result.output = self._clean_output(result.output)
+        return result
 
     @staticmethod
     def _clean_output(output: str) -> str:
@@ -167,9 +146,10 @@ class GeminiModelRunner(ModelRunner):
     Runner for Gemini 3.1 Pro via the Antigravity `agy` agentic CLI.
 
     The standalone `gemini` CLI is deprecated (its personal OAuth tier is no
-    longer eligible), so Gemini access now goes through `agy`. Uses `agy -p`
-    for non-interactive print mode with stdin closed (the prompt is passed via
-    the -p flag; agy has no stdin-append mode).
+    longer eligible), so Gemini access now goes through `agy`. Local agy help
+    and changelog text confirm NDJSON stdin mode and named stream-json output
+    events. They do not establish the exact request envelope used below; that
+    schema is provisional and covered by mocks pending a networked contract run.
     """
 
     def __init__(
@@ -182,7 +162,7 @@ class GeminiModelRunner(ModelRunner):
         # gemini-3.1-pro-preview; that no longer applies on agy, which accepts
         # the stable "gemini-3.1-pro" id.
         self.model = model
-        self.timeout = timeout
+        self.timeout = validate_timeout(timeout)
         self._binary = self._find_agy_binary()
 
     @staticmethod
@@ -207,93 +187,69 @@ class GeminiModelRunner(ModelRunner):
         return "agy"
 
     def run(self, prompt: str, context: Optional[str] = None) -> RunResult:
-        """Run prompt through the agy CLI.
-
-        agy has no stdin-append mode, so the full prompt is passed via -p with
-        stdin closed (input="") to keep the run non-interactive.
-        """
+        """Run the provisional prompt event through agy's stream-json mode."""
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
 
-        # agy print mode: --dangerously-skip-permissions auto-approves any tool
-        # calls so the run never blocks on a permission prompt. --print-timeout
-        # governs agy's own wait; keep it just under our hard timeout.
         cmd = [
             self._binary,
-            "--dangerously-skip-permissions",
             "--model", self.model,
-            "--print-timeout", f"{max(self.timeout - 30, 30)}s",
-            "-p", full_prompt,
+            "--print-timeout", f"{max(self.timeout - 1, 1)}s",
+            "--input-format=stream-json",
+            "--output-format=stream-json",
+            "--print=",
         ]
+        if permission_automation_enabled():
+            cmd.append("--dangerously-skip-permissions")
 
-        env = {k: v for k, v in os.environ.items()}
-
+        # Provisional schema: local help documents one NDJSON message per line,
+        # but offline evidence does not specify the message object's exact keys.
+        # The mocked tests assert this repository-side expectation only.
+        stdin_payload = json.dumps(
+            {"type": "user", "message": full_prompt},
+            ensure_ascii=False,
+        ) + "\n"
+        result = run_hardened_subprocess(
+            cmd,
+            stdin_text=stdin_payload,
+            timeout=self.timeout,
+            sensitive_values=tuple(
+                value for value in (full_prompt, prompt, context) if value
+            ),
+        )
+        if not result.success:
+            return result
         try:
-            result = subprocess.run(
-                cmd,
-                input="",  # close stdin so agy stays non-interactive
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                env=env,
-            )
-
-            if result.returncode != 0:
-                return RunResult(
-                    output="",
-                    success=False,
-                    error=result.stderr or f"Exit code: {result.returncode}",
-                    raw_output=result.stdout,
-                )
-
-            clean_output = self._clean_output(result.stdout)
-            return RunResult(
-                output=clean_output,
-                success=True,
-                raw_output=result.stdout,
-            )
-
-        except subprocess.TimeoutExpired:
-            return RunResult(
-                output="",
-                success=False,
-                error=f"Timeout after {self.timeout}s",
-            )
-        except Exception as e:
-            return RunResult(
-                output="",
-                success=False,
-                error=str(e),
-            )
+            result.output = self._clean_output(result.output)
+        except ValueError as exc:
+            return RunResult(output="", success=False, error=str(exc))
+        return result
 
     @staticmethod
     def _clean_output(output: str) -> str:
-        """Remove ANSI codes and strip agy CLI preamble lines.
-
-        agy print mode may emit credential/model banner lines to stdout
-        before the actual model output. These contaminate parsed responses,
-        so strip any leading lines that match known patterns.
-        """
+        """Extract model text from the provisionally expected result event."""
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        cleaned = ansi_escape.sub('', output)
+        terminal_result = None
+        for line_number, line in enumerate(output.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid agy stream-json event on line {line_number}"
+                ) from exc
+            if not isinstance(event, dict) or event.get("type") != "result":
+                continue
+            if event.get("is_error"):
+                raise ValueError("agy stream-json terminal result reported an error")
+            value = event.get("result")
+            if not isinstance(value, str):
+                raise ValueError("agy stream-json terminal result has no text result")
+            terminal_result = value
 
-        preamble_patterns = (
-            "Loaded cached credentials",
-            "Data collection is disabled",
-            "Using model:",
-            "Auto-approve",
-        )
-        lines = cleaned.splitlines()
-        start = 0
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if any(stripped.startswith(p) for p in preamble_patterns):
-                start = i + 1
-                continue
-            start = i
-            break
-        return "\n".join(lines[start:]).strip()
+        if terminal_result is None:
+            raise ValueError("agy stream-json output has no terminal result event")
+        return ansi_escape.sub("", terminal_result).strip()
 
 
 def get_runner_for_model(model: str) -> ModelRunner:

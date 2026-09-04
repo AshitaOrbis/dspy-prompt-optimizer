@@ -26,7 +26,12 @@ Examples:
 """
 
 import argparse
+import hashlib
 import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add lib to path
@@ -75,13 +80,24 @@ from prompt_optimizer.format_instructions import (
 )
 from prompt_optimizer.demo_transformers import get_demo_transformer
 from prompt_optimizer.batch import (
+    ArtifactIdentity,
+    BatchResult,
+    BatchSummary,
     BatchTarget,
+    load_prompt,
+    load_training_data,
     optimize_batch_sequential,
     optimize_batch_parallel,
     generate_batch_report,
+    _candidate_content_hash,
+    _persist_and_verify_artifact,
 )
-from prompt_optimizer.verification import pre_flight_holdout_check
-from prompt_optimizer.bootstrap import TrainingExample as HoldoutExample
+from prompt_optimizer.bootstrap import (
+    BootstrapResult,
+    load_holdout_jsonl,
+    promote_candidate_atomic,
+    promote_candidate_with_holdout,
+)
 
 
 # Default metric mappings
@@ -397,6 +413,12 @@ def main():
         default="datasets",
         help="Directory containing holdout files (default: datasets, used with --holdout-gate)",
     )
+    parser.add_argument(
+        "--min-holdout-improvement",
+        type=float,
+        default=-0.02,
+        help="Minimum candidate-minus-incumbent holdout delta (default: -0.02)",
+    )
 
     args = parser.parse_args()
 
@@ -476,293 +498,286 @@ def main():
         print(f"Mode: {'Parallel' if args.parallel else 'Sequential'}")
         print()
 
-    # Setup
+    # Every optimizer writes only into a private staging store. The production
+    # store is changed once, after the selected algorithm and optional gate pass.
     runner = ClaudeRunner(model=model, timeout=args.timeout)
-    storage = DemoStorage()
+    production_storage = DemoStorage(args.output)
+    staging_context = tempfile.TemporaryDirectory(prefix="dspy-prompt-stage-")
+    staging_root = Path(staging_context.name)
+    optimization_started = datetime.now()
+    started_monotonic = time.monotonic()
 
-    # Backup existing _latest.json files if holdout gate is enabled
-    if args.holdout_gate:
-        import shutil as gate_shutil
-        prompts_dir = storage.prompts_dir
-        for target in targets:
-            latest_path = prompts_dir / f"{target.name}_latest.json"
-            backup_path = prompts_dir / f"{target.name}_latest.json.pre-gate"
-            if latest_path.exists():
-                gate_shutil.copy2(latest_path, backup_path)
-                if verbose:
-                    print(f"  Backed up {target.name}_latest.json for holdout gate")
-
-    # Tiered optimization: Haiku -> Sonnet -> Opus
-    if args.tier == "tiered":
-        if verbose:
-            print("=" * 50)
-            print("TIERED OPTIMIZATION: Haiku -> Sonnet -> Opus")
-            print("=" * 50)
-
-        # Phase 1: Haiku (quick baseline)
-        if verbose:
-            print("\n[Phase 1] Haiku baseline...")
-        haiku_runner = ClaudeRunner(model="haiku", timeout=args.timeout)
-        summary = optimize_batch_sequential(
-            targets=targets,
-            runner=haiku_runner,
-            storage=storage,
-            verbose=verbose,
+    def build_summary(results):
+        ended = datetime.now()
+        successful = sum(1 for item in results if item.succeeded)
+        failed = len(results) - successful
+        return BatchSummary(
+            total_targets=len(results),
+            successful=successful,
+            failed=failed,
+            results=results,
+            start_time=optimization_started.isoformat(),
+            end_time=ended.isoformat(),
+            total_duration_seconds=time.monotonic() - started_monotonic,
         )
 
-        # Phase 2: Sonnet (refinement) on successful targets
-        successful_targets = [t for t in targets if any(
-            r.success for r in summary.results if r.target.name == t.name
-        )]
-        if successful_targets and verbose:
-            print(f"\n[Phase 2] Sonnet refinement on {len(successful_targets)} targets...")
-        if successful_targets:
-            sonnet_runner = ClaudeRunner(model="sonnet", timeout=args.timeout)
-            summary = optimize_batch_sequential(
-                targets=successful_targets,
-                runner=sonnet_runner,
-                storage=storage,
-                verbose=verbose,
-            )
+    def mark_algorithm(result, algorithm, **extra):
+        if result is None:
+            return
+        candidate = result.optimized_prompt
+        candidate.metadata = {**(candidate.metadata or {}), "algorithm": algorithm, **extra}
 
-        # Phase 3: Opus (polish) on high-scoring targets
-        if verbose:
-            print(f"\n[Phase 3] Opus polish...")
-        opus_runner = ClaudeRunner(model="opus", timeout=args.timeout)
-        summary = optimize_batch_sequential(
-            targets=successful_targets[:3],  # Opus is expensive, limit targets
-            runner=opus_runner,
-            storage=storage,
-            verbose=verbose,
-        )
-
-    # Standard optimization with selected algorithm
-    elif args.algorithm == "bootstrap":
-        if args.parallel:
-            summary = optimize_batch_parallel(
-                targets=targets,
-                runner=runner,
-                storage=storage,
-                max_workers=args.workers,
-                verbose=verbose,
-            )
-        else:
-            summary = optimize_batch_sequential(
-                targets=targets,
-                runner=runner,
-                storage=storage,
-                verbose=verbose,
-            )
-
-    elif args.algorithm in ("copro", "iterative"):
-        # For COPRO/Iterative, process sequentially with enhanced algorithms
-        from prompt_optimizer.bootstrap import TrainingExample
-        import json
-
-        results = []
-        for target in targets:
+    try:
+        # Tiered optimization: each phase has its own store and no phase can
+        # replace production before the complete progression succeeds.
+        if args.tier == "tiered":
             if verbose:
-                print(f"\n{'='*50}")
-                print(f"Processing: {target.name}")
-                print(f"{'='*50}")
+                print("=" * 50)
+                print("TIERED OPTIMIZATION: Haiku -> Sonnet -> Opus")
+                print("=" * 50)
 
-            # Load training data
-            training_data = []
-            with open(target.training_data_path) as f:
-                for line in f:
-                    if line.strip():
-                        data = json.loads(line)
-                        training_data.append(TrainingExample(
-                            input_text=data["input"],
-                            expected_output=data["expected"],
-                            metadata=data.get("metadata"),
-                        ))
-
-            # Load base prompt
-            with open(target.prompt_path) as f:
-                base_prompt = f.read()
-
-            if args.algorithm == "copro":
-                copro = COPROOptimizer(runner, n_variants=args.variants, storage=storage)
-                copro_result, bootstrap_result = copro.optimize_with_bootstrap(
-                    base_prompt=base_prompt,
-                    training_data=training_data,
-                    metric_fn=target.metric_fn,
-                    threshold=target.threshold,
-                    max_demos=target.max_demos,
-                    agent_name=target.name,
+            phase_results = {}
+            completed_tiers = {target.name: [] for target in targets}
+            active_targets = list(targets)
+            for phase_index, (phase_name, phase_targets) in enumerate(
+                (("haiku", active_targets), ("sonnet", None), ("opus", None))
+            ):
+                if phase_name == "sonnet":
+                    phase_targets = [
+                        target for target in active_targets
+                        if phase_results[target.name].error is None
+                        and phase_results[target.name].result is not None
+                    ]
+                elif phase_name == "opus":
+                    phase_targets = [
+                        target for target in active_targets
+                        if phase_results[target.name].error is None
+                        and phase_results[target.name].result is not None
+                    ][:3]
+                if not phase_targets:
+                    continue
+                if verbose:
+                    print(f"\n[Phase {phase_index + 1}] {phase_name.title()}...")
+                phase_summary = optimize_batch_sequential(
+                    targets=phase_targets,
+                    runner=ClaudeRunner(model=phase_name, timeout=args.timeout),
+                    storage=DemoStorage(str(staging_root / phase_name)),
                     verbose=verbose,
                 )
-                if verbose:
-                    print(f"COPRO improvement: {copro_result.improvement:+.3f}")
+                for item in phase_summary.results:
+                    phase_results[item.target.name] = item
+                    if item.error is None and item.result is not None:
+                        completed_tiers[item.target.name].append(phase_name)
 
-            else:  # iterative
-                iterative = IterativeOptimizer(runner, max_rounds=args.rounds, storage=storage)
-                iter_result = iterative.optimize(
-                    base_prompt=base_prompt,
-                    training_data=training_data,
-                    metric_fn=target.metric_fn,
-                    threshold=target.threshold,
-                    max_demos=target.max_demos,
-                    agent_name=target.name,
+            final_results = []
+            for target in targets:
+                item = phase_results.get(target.name)
+                if item is None:
+                    item = BatchResult(target, None, "tiered optimization produced no result", 0.0)
+                if item.error is None and item.result is not None:
+                    mark_algorithm(
+                        item.result,
+                        "tiered",
+                        completed_tiers=completed_tiers[target.name],
+                    )
+                    item.artifact = _persist_and_verify_artifact(
+                        target=target,
+                        result=item.result,
+                        storage=DemoStorage(str(staging_root / "tiered-final")),
+                        run_id=str(uuid.uuid4()),
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                final_results.append(item)
+            summary = build_summary(final_results)
+
+        elif args.algorithm == "bootstrap":
+            staged_storage = DemoStorage(str(staging_root / "bootstrap"))
+            if args.parallel:
+                summary = optimize_batch_parallel(
+                    targets=targets,
+                    runner=runner,
+                    storage=staged_storage,
+                    max_workers=args.workers,
                     verbose=verbose,
                 )
-                if verbose:
-                    if iter_result.rounds:
-                        initial_score = iter_result.rounds[0].score
-                        improvement = iter_result.final_score - initial_score
-                    else:
-                        improvement = 0.0
-                    print(f"Iterative improvement: {improvement:+.3f}")
-
-        # Use bootstrap summary for now (algorithms track their own results)
-        summary = optimize_batch_sequential(
-            targets=targets,
-            runner=runner,
-            storage=storage,
-            verbose=False,
-        )
-
-    else:
-        # Default bootstrap
-        if args.parallel:
-            summary = optimize_batch_parallel(
-                targets=targets,
-                runner=runner,
-                storage=storage,
-                max_workers=args.workers,
-                verbose=verbose,
-            )
-        else:
-            summary = optimize_batch_sequential(
-                targets=targets,
-                runner=runner,
-                storage=storage,
-                verbose=verbose,
-            )
-
-    # Pre-flight holdout gate (if enabled)
-    # Strategy: backup _latest.json before optimization, restore if gate fails.
-    # Since optimization already ran and overwrote _latest.json, we compare the
-    # new _latest.json against the backed-up version on holdout data.
-    if args.holdout_gate:
-        import json as gate_json
-        import shutil
-        holdout_dir = Path(args.holdout_dir)
-        all_metrics = {**AGENT_METRICS, **SKILL_METRICS}
-        prompts_dir = storage.prompts_dir
-
-        if verbose:
-            print("\n" + "=" * 50)
-            print("PRE-FLIGHT HOLDOUT GATE")
-            print("=" * 50)
-
-        for target in targets:
-            # Find holdout file
-            data_basename = AGENT_DATA_PATHS.get(target.name) or SKILL_DATA_PATHS.get(target.name) or target.name
-            data_basename = data_basename.replace(".jsonl", "")
-            holdout_path = holdout_dir / f"{data_basename}-holdout.jsonl"
-
-            if not holdout_path.exists():
-                if verbose:
-                    print(f"\n  {target.name}: No holdout file, skipping gate")
-                continue
-
-            metric_fn = all_metrics.get(target.name)
-            if not metric_fn:
-                if verbose:
-                    print(f"\n  {target.name}: No metric function, skipping gate")
-                continue
-
-            # Load holdout data
-            holdout_data = []
-            with open(holdout_path) as f:
-                for line in f:
-                    if line.strip():
-                        data = gate_json.loads(line)
-                        holdout_data.append(HoldoutExample(
-                            input_text=data["input"],
-                            expected_output=data["expected"],
-                            metadata=data.get("metadata"),
-                        ))
-
-            # Check if there's a backup from before this run
-            latest_path = prompts_dir / f"{target.name}_latest.json"
-            backup_path = prompts_dir / f"{target.name}_latest.json.pre-gate"
-
-            # Load the current (newly optimized) prompt
-            new_optimized = storage.load_optimized_prompt(target.name)
-            if not new_optimized:
-                if verbose:
-                    print(f"\n  {target.name}: No optimization found, skipping gate")
-                continue
-
-            # Evaluate new optimization on holdout
-            new_prompt = new_optimized.to_prompt()
-            new_scores = []
-            for i, ex in enumerate(holdout_data):
-                full_prompt = f"{new_prompt}\n\n## New Input\n\n{ex.input_text}"
-                result = runner.run(full_prompt)
-                if result.success:
-                    score = metric_fn(ex.expected_output, result.output)
-                    new_scores.append(score)
-                    if verbose:
-                        print(f"  [{target.name} holdout {i+1}/{len(holdout_data)}] {score:.3f}")
-
-            new_avg = sum(new_scores) / len(new_scores) if new_scores else 0.0
-
-            if verbose:
-                print(f"\n  {target.name}: New holdout avg = {new_avg:.3f}")
-
-            if backup_path.exists():
-                # Evaluate the BACKUP (previous _latest.json) on the SAME
-                # holdout data to get an apples-to-apples holdout comparison.
-                # (Previous versions compared new holdout vs old training
-                # avg_score — wrong scale, wrong metric.)
-                from prompt_optimizer.storage import OptimizedPrompt, Demo
-                with open(backup_path) as bf:
-                    backup_data = gate_json.load(bf)
-                old_demos = [Demo(**d) for d in backup_data.get("demos", [])]
-                old_optimized = OptimizedPrompt(
-                    base_prompt=backup_data["base_prompt"],
-                    demos=old_demos,
-                    optimization_date=backup_data["optimization_date"],
-                    metric_name=backup_data["metric_name"],
-                    threshold=backup_data["threshold"],
-                    avg_score=backup_data["avg_score"],
-                    metadata=backup_data.get("metadata"),
-                    format_instruction=backup_data.get("format_instruction", ""),
-                )
-                old_prompt = old_optimized.to_prompt()
-                old_scores = []
-                for i, ex in enumerate(holdout_data):
-                    full_prompt = f"{old_prompt}\n\n## New Input\n\n{ex.input_text}"
-                    result = runner.run(full_prompt)
-                    if result.success:
-                        score = metric_fn(ex.expected_output, result.output)
-                        old_scores.append(score)
-                        if verbose:
-                            print(f"  [{target.name} backup holdout {i+1}/{len(holdout_data)}] {score:.3f}")
-
-                old_avg = sum(old_scores) / len(old_scores) if old_scores else 0.0
-
-                if verbose:
-                    print(f"  {target.name}: Previous holdout avg = {old_avg:.3f}")
-
-                if new_avg < old_avg - 0.02:
-                    if verbose:
-                        print(f"  GATE FAILED: Regression ({new_avg:.3f} < {old_avg:.3f} - 0.02)")
-                        print(f"  Restoring previous _latest.json from backup")
-                    shutil.copy2(backup_path, latest_path)
-                    # Keep backup for auditing; caller can clean up if desired
-                else:
-                    if verbose:
-                        print(f"  GATE PASSED: {new_avg:.3f} >= {old_avg:.3f} - 0.02")
-                    # Clean up backup on pass
-                    backup_path.unlink(missing_ok=True)
             else:
-                if verbose:
-                    print(f"  No previous optimization (first run). Gate: auto-pass.")
+                summary = optimize_batch_sequential(
+                    targets=targets,
+                    runner=runner,
+                    storage=staged_storage,
+                    verbose=verbose,
+                )
+            for item in summary.results:
+                if item.error is None:
+                    mark_algorithm(item.result, "bootstrap")
+                    if item.result is not None:
+                        item.artifact = _persist_and_verify_artifact(
+                            target=item.target,
+                            result=item.result,
+                            storage=staged_storage,
+                            run_id=str(uuid.uuid4()),
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        )
+
+        else:  # COPRO or iterative: construct the summary from that result.
+            staged_storage = DemoStorage(str(staging_root / args.algorithm))
+            algorithm_results = []
+            for target in targets:
+                target_started = time.monotonic()
+                try:
+                    training_data = load_training_data(target.training_data_path)
+                    base_prompt = load_prompt(target.prompt_path)
+                    if args.algorithm == "copro":
+                        optimizer = COPROOptimizer(
+                            runner,
+                            n_variants=args.variants,
+                            storage=staged_storage,
+                        )
+                        copro_result, result = optimizer.optimize_with_bootstrap(
+                            base_prompt=base_prompt,
+                            training_data=training_data,
+                            metric_fn=target.metric_fn,
+                            threshold=target.threshold,
+                            max_demos=target.max_demos,
+                            agent_name=target.name,
+                            verbose=verbose,
+                        )
+                        mark_algorithm(
+                            result,
+                            "copro",
+                            copro_strategy=copro_result.best_strategy
+                            if hasattr(copro_result, "best_strategy") else None,
+                        )
+                        if verbose:
+                            print(f"COPRO improvement: {copro_result.improvement:+.3f}")
+                    else:
+                        optimizer = IterativeOptimizer(
+                            runner,
+                            max_rounds=args.rounds,
+                            storage=staged_storage,
+                        )
+                        iterative_result = optimizer.optimize(
+                            base_prompt=base_prompt,
+                            training_data=training_data,
+                            metric_fn=target.metric_fn,
+                            threshold=target.threshold,
+                            max_demos=target.max_demos,
+                            agent_name=target.name,
+                            verbose=verbose,
+                        )
+                        candidate = iterative_result.final_prompt
+                        candidate.metadata = {
+                            **(candidate.metadata or {}),
+                            "algorithm": "iterative",
+                        }
+                        result = BootstrapResult(
+                            optimized_prompt=candidate,
+                            total_examples=len(training_data),
+                            successful_examples=len(candidate.demos),
+                            failed_examples=0,
+                            avg_score=iterative_result.final_score,
+                            traces=[],
+                        )
+                        if verbose:
+                            initial = iterative_result.rounds[0].score if iterative_result.rounds else 0.0
+                            print(f"Iterative improvement: {iterative_result.final_score - initial:+.3f}")
+                    algorithm_results.append(
+                        BatchResult(
+                            target=target,
+                            result=result,
+                            error=None,
+                            duration_seconds=time.monotonic() - target_started,
+                            artifact=_persist_and_verify_artifact(
+                                target=target,
+                                result=result,
+                                storage=staged_storage,
+                                run_id=str(uuid.uuid4()),
+                                created_at=datetime.now(timezone.utc).isoformat(),
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    algorithm_results.append(
+                        BatchResult(
+                            target=target,
+                            result=None,
+                            error=f"{type(exc).__name__}: {exc}",
+                            duration_seconds=time.monotonic() - target_started,
+                        )
+                    )
+            summary = build_summary(algorithm_results)
+
+        # One promotion implementation for every algorithm and caller. Gate
+        # failures become batch failures, so process status cannot report success.
+        holdout_dir = Path(args.holdout_dir)
+        for item in summary.results:
+            if not item.succeeded:
+                if item.error is None:
+                    item.error = "optimization produced no verified staged artifact"
+                continue
+            target = item.target
+            candidate = item.result.optimized_prompt
+            try:
+                if args.holdout_gate:
+                    data_basename = (
+                        AGENT_DATA_PATHS.get(target.name)
+                        or SKILL_DATA_PATHS.get(target.name)
+                        or target.name
+                    ).replace(".jsonl", "")
+                    holdout_path = holdout_dir / f"{data_basename}-holdout.jsonl"
+                    holdout_data = load_holdout_jsonl(holdout_path)
+                    promotion = promote_candidate_with_holdout(
+                        agent_name=target.name,
+                        candidate=candidate,
+                        holdout_data=holdout_data,
+                        metric_fn=target.metric_fn,
+                        runner=runner,
+                        storage=production_storage,
+                        min_improvement=args.min_holdout_improvement,
+                        verbose=verbose,
+                    )
+                    promoted_path = promotion.latest_path
+                else:
+                    promoted_path = promote_candidate_atomic(
+                        target.name, candidate, production_storage
+                    )
+                staged_artifact = item.artifact
+                promoted_content_hash = _candidate_content_hash(candidate)
+                recorded_content_hash = (candidate.metadata or {}).get(
+                    "artifact_content_hash"
+                )
+                if recorded_content_hash != promoted_content_hash:
+                    raise RuntimeError(
+                        "promoted artifact content identity does not match its metadata"
+                    )
+                item.artifact = ArtifactIdentity(
+                    run_id=staged_artifact.run_id,
+                    created_at=staged_artifact.created_at,
+                    content_hash=promoted_content_hash,
+                    file_hash=hashlib.sha256(promoted_path.read_bytes()).hexdigest(),
+                    path=promoted_path,
+                )
+            except Exception as exc:
+                item.error = f"promotion failed: {type(exc).__name__}: {exc}"
+
+        # Recompute truthful completion counts after promotion/gating.
+        summary = BatchSummary(
+            total_targets=len(summary.results),
+            successful=sum(
+                1 for item in summary.results
+                if item.succeeded
+            ),
+            failed=sum(
+                1 for item in summary.results
+                if not item.succeeded
+            ),
+            results=summary.results,
+            start_time=summary.start_time,
+            end_time=datetime.now().isoformat(),
+            total_duration_seconds=time.monotonic() - started_monotonic,
+        )
+    finally:
+        staging_context.cleanup()
 
     # Generate report
     if args.report:

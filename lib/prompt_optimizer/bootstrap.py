@@ -12,14 +12,23 @@ Phase 5 additions:
 - Example dropout regularization
 """
 
+import fcntl
+import hashlib
+import json
 import logging
+import math
+import os
 import random
-from dataclasses import dataclass
-from datetime import datetime
+import tempfile
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Dict, Any
 
-from .claude_runner import ClaudeRunner, RunResult
-from .storage import Demo, OptimizedPrompt, DemoStorage
+from .claude_runner import ClaudeRunner
+from .storage import Demo, OptimizedPrompt, DemoStorage, SafeJSONEncoder
+from .validation import contained_path, validate_name
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +39,507 @@ class TrainingExample:
     input_text: str
     expected_output: str
     metadata: Optional[Dict[str, Any]] = None
+
+
+class HoldoutGateError(RuntimeError):
+    """Raised when required holdout evidence is absent, incomplete, or failing."""
+
+
+@dataclass(frozen=True)
+class GatePromotionResult:
+    """Evidence returned after a candidate passes and is atomically promoted."""
+
+    new_score: float
+    existing_score: float
+    evaluated_examples: int
+    latest_path: Path
+    corpus_sha256: str
+    corpus_cardinality: int
+    incumbent_artifact_sha256: str
+
+
+@dataclass(frozen=True)
+class HoldoutCorpusIdentity:
+    """Stable identity of an ordered, parsed holdout corpus."""
+
+    sha256: str
+    cardinality: int
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"sha256": self.sha256, "cardinality": self.cardinality}
+
+
+def holdout_corpus_identity(
+    examples: List[TrainingExample],
+) -> HoldoutCorpusIdentity:
+    """Hash every ordered example plus its expected output and metadata."""
+    if not examples:
+        raise HoldoutGateError("Holdout data is required and must be non-empty")
+    ordered_examples = [
+        {
+            "input": example.input_text,
+            "expected": example.expected_output,
+            "metadata": example.metadata,
+        }
+        for example in examples
+    ]
+    try:
+        encoded = json.dumps(
+            ordered_examples,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HoldoutGateError(
+            f"Holdout corpus cannot be assigned a stable identity: {exc}"
+        ) from exc
+    return HoldoutCorpusIdentity(
+        sha256=hashlib.sha256(encoded).hexdigest(),
+        cardinality=len(examples),
+    )
+
+
+def _parse_corpus_identity(value: Any) -> HoldoutCorpusIdentity:
+    if not isinstance(value, dict):
+        raise HoldoutGateError(
+            "Incumbent artifact has no recorded holdout corpus identity"
+        )
+    digest = value.get("sha256")
+    cardinality = value.get("cardinality")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or isinstance(cardinality, bool)
+        or not isinstance(cardinality, int)
+        or cardinality <= 0
+    ):
+        raise HoldoutGateError(
+            "Incumbent artifact has no valid recorded holdout corpus identity"
+        )
+    return HoldoutCorpusIdentity(sha256=digest, cardinality=cardinality)
+
+
+def _recorded_corpus_identity(incumbent: OptimizedPrompt) -> HoldoutCorpusIdentity:
+    metadata = incumbent.metadata
+    gate_evidence = metadata.get("holdout_gate") if isinstance(metadata, dict) else None
+    value = (
+        gate_evidence.get("corpus_identity")
+        if isinstance(gate_evidence, dict)
+        else None
+    )
+    return _parse_corpus_identity(value)
+
+
+_ARTIFACT_IDENTITY_KEYS = {
+    "artifact_run_id",
+    "artifact_created_at",
+    "artifact_content_hash",
+}
+
+
+def _prompt_semantic_hash(candidate: OptimizedPrompt) -> str:
+    """Mirror the batch artifact hash while excluding self-identity fields."""
+    payload = asdict(candidate)
+    metadata = dict(payload.get("metadata") or {})
+    for key in _ARTIFACT_IDENTITY_KEYS:
+        metadata.pop(key, None)
+    payload["metadata"] = metadata or None
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+        cls=SafeJSONEncoder,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _encode_prompt(candidate: OptimizedPrompt) -> bytes:
+    return json.dumps(asdict(candidate), indent=2, cls=SafeJSONEncoder).encode("utf-8")
+
+
+def _decode_prompt_snapshot(payload: bytes) -> OptimizedPrompt:
+    """Decode the exact incumbent bytes captured for compare-and-swap."""
+    try:
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise ValueError("prompt artifact must be an object")
+        raw_demos = data.get("demos")
+        if not isinstance(raw_demos, list):
+            raise ValueError("prompt demos must be a list")
+        demos = []
+        for raw_demo in raw_demos:
+            if not isinstance(raw_demo, dict):
+                raise ValueError("prompt demo must be an object")
+            demos.append(
+                Demo(
+                    input_text=raw_demo["input_text"],
+                    output_text=raw_demo["output_text"],
+                    score=raw_demo["score"],
+                    metadata=raw_demo.get("metadata"),
+                )
+            )
+        return OptimizedPrompt(
+            base_prompt=data["base_prompt"],
+            demos=demos,
+            optimization_date=data["optimization_date"],
+            metric_name=data["metric_name"],
+            threshold=data["threshold"],
+            avg_score=data["avg_score"],
+            metadata=data.get("metadata"),
+            format_instruction=data.get("format_instruction", ""),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HoldoutGateError(
+            f"Incumbent/backup is unreadable or malformed: {exc}"
+        ) from exc
+
+
+def load_holdout_jsonl(path: Path) -> List[TrainingExample]:
+    """Load a required, non-empty holdout JSONL file or fail closed."""
+    path = Path(path)
+    if not path.exists():
+        raise HoldoutGateError(f"Holdout file is missing: {path}")
+    if not path.is_file():
+        raise HoldoutGateError(f"Holdout path is not a readable file: {path}")
+
+    examples: List[TrainingExample] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise HoldoutGateError(
+                        f"Malformed holdout JSON at {path}:{line_number}: {exc.msg}"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise HoldoutGateError(
+                        f"Malformed holdout entry at {path}:{line_number}: expected object"
+                    )
+                input_text = payload.get("input")
+                expected_output = payload.get("expected")
+                if not isinstance(input_text, str) or not isinstance(expected_output, str):
+                    raise HoldoutGateError(
+                        f"Malformed holdout entry at {path}:{line_number}: "
+                        "'input' and 'expected' must be strings"
+                    )
+                examples.append(
+                    TrainingExample(
+                        input_text=input_text,
+                        expected_output=expected_output,
+                        metadata=payload.get("metadata"),
+                    )
+                )
+    except HoldoutGateError:
+        raise
+    except OSError as exc:
+        raise HoldoutGateError(f"Holdout file is unreadable: {path}: {exc}") from exc
+
+    if not examples:
+        raise HoldoutGateError(f"Holdout file is empty: {path}")
+    return examples
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    """Write bytes via an fsynced same-directory temporary file and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def _promotion_lock(latest_path: Path):
+    """Serialize cooperating writers while an exact latest snapshot is checked."""
+    lock_path = latest_path.with_name(f"{latest_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def promote_candidate_atomic(
+    agent_name: str,
+    candidate: OptimizedPrompt,
+    storage: DemoStorage,
+    *,
+    expected_latest_bytes: Optional[bytes] = None,
+    expected_latest_absent: bool = False,
+) -> Path:
+    """Persist history and replace latest under a compare-and-swap lock."""
+    validate_name(agent_name, kind="agent name")
+    if not isinstance(candidate, OptimizedPrompt) or not candidate.demos:
+        raise HoldoutGateError("Candidate prompt is missing or contains no demonstrations")
+
+    prompts_dir = storage.prompts_dir
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    history_json = contained_path(prompts_dir, f"{agent_name}_{timestamp}.json")
+    history_markdown = contained_path(prompts_dir, f"{agent_name}_{timestamp}.md")
+    latest_path = contained_path(prompts_dir, f"{agent_name}_latest.json")
+    encoded = _encode_prompt(candidate)
+
+    with _promotion_lock(latest_path):
+        if expected_latest_bytes is not None and expected_latest_absent:
+            raise ValueError(
+                "expected_latest_bytes and expected_latest_absent are mutually exclusive"
+            )
+        if expected_latest_absent and latest_path.exists():
+            raise HoldoutGateError(
+                "Incumbent changed during holdout evaluation; stale promotion refused"
+            )
+        if expected_latest_bytes is not None:
+            try:
+                current_bytes = latest_path.read_bytes()
+            except OSError as exc:
+                raise HoldoutGateError(
+                    f"Incumbent changed during holdout evaluation: {exc}"
+                ) from exc
+            if current_bytes != expected_latest_bytes:
+                raise HoldoutGateError(
+                    "Incumbent changed during holdout evaluation; stale promotion refused"
+                )
+
+        # A failure while writing demos/history leaves the incumbent latest untouched.
+        storage.save_demos(agent_name, candidate.demos)
+        _atomic_write(history_json, encoded)
+        _atomic_write(history_markdown, candidate.to_markdown().encode("utf-8"))
+
+        # Re-check after the ancillary writes, immediately before replacement.
+        if (
+            expected_latest_bytes is not None
+            and latest_path.read_bytes() != expected_latest_bytes
+        ):
+            raise HoldoutGateError(
+                "Incumbent changed during holdout evaluation; stale promotion refused"
+            )
+        _atomic_write(latest_path, encoded)
+    return latest_path
+
+
+def _rollback_promoted_latest(
+    latest_path: Path,
+    promoted_bytes: bytes,
+    incumbent_bytes: bytes,
+) -> None:
+    """Restore only if latest still equals the artifact this gate promoted."""
+    with _promotion_lock(latest_path):
+        try:
+            current_bytes = latest_path.read_bytes()
+        except OSError as exc:
+            logger.warning("Could not inspect latest for gate rollback: %s", exc)
+            return
+        if current_bytes != promoted_bytes:
+            logger.warning(
+                "Latest changed after gate promotion; refusing to overwrite concurrent update"
+            )
+            return
+        _atomic_write(latest_path, incumbent_bytes)
+
+
+class _CompleteCoverageRunner:
+    """Track every gate call so failed/partial evaluation cannot look complete."""
+
+    def __init__(self, runner: ClaudeRunner):
+        self._runner = runner
+        self.calls = 0
+        self.failures: List[str] = []
+
+    def run(self, prompt: str):
+        self.calls += 1
+        try:
+            result = self._runner.run(prompt)
+        except Exception as exc:
+            self.failures.append(f"{type(exc).__name__}: {exc}")
+            raise
+        if result is None or not getattr(result, "success", False):
+            error = getattr(result, "error", "missing runner result")
+            self.failures.append(str(error))
+        return result
+
+
+def promote_candidate_with_holdout(
+    agent_name: str,
+    candidate: OptimizedPrompt,
+    holdout_data: List[TrainingExample],
+    metric_fn: Callable[[str, str], float],
+    runner: ClaudeRunner,
+    storage: DemoStorage,
+    min_improvement: float = 0.0,
+    verbose: bool = True,
+    on_promoted: Optional[Callable[[float, float], None]] = None,
+) -> GatePromotionResult:
+    """Evaluate a staged candidate and atomically promote only on a complete pass.
+
+    Gate policy is deliberately strict: runner failures abort the comparison rather
+    than being averaged over a smaller denominator. Both candidate and incumbent
+    must produce one finite score for every example in the same non-empty holdout.
+    An incumbent is required because a promotion gate cannot make a symmetric
+    comparison without its rollback artifact.
+    """
+    corpus_identity = holdout_corpus_identity(holdout_data)
+    if not callable(metric_fn):
+        raise HoldoutGateError("A callable holdout metric is required")
+    if not isinstance(candidate, OptimizedPrompt) or not candidate.demos:
+        raise HoldoutGateError("Candidate prompt is missing or contains no demonstrations")
+
+    validate_name(agent_name, kind="agent name")
+    latest_path = contained_path(storage.prompts_dir, f"{agent_name}_latest.json")
+    backup_path = contained_path(storage.prompts_dir, f"{agent_name}_latest.json.pre-gate")
+    if not latest_path.exists():
+        raise HoldoutGateError(
+            f"Incumbent/backup is missing for holdout-gated promotion: {latest_path}"
+        )
+
+    try:
+        incumbent_bytes = latest_path.read_bytes()
+    except OSError as exc:
+        raise HoldoutGateError(f"Incumbent/backup is unreadable: {exc}") from exc
+    incumbent = _decode_prompt_snapshot(incumbent_bytes)
+    if incumbent is None or not incumbent.demos:
+        raise HoldoutGateError("Incumbent/backup is missing a valid optimized prompt")
+    recorded_identity = _recorded_corpus_identity(incumbent)
+    if recorded_identity != corpus_identity:
+        raise HoldoutGateError(
+            "Holdout corpus identity mismatch: "
+            f"incumbent={recorded_identity.sha256}/{recorded_identity.cardinality}, "
+            f"current={corpus_identity.sha256}/{corpus_identity.cardinality}"
+        )
+    incumbent_artifact_sha256 = hashlib.sha256(incumbent_bytes).hexdigest()
+
+    # Keep an audit/rollback artifact until the atomic promotion has succeeded.
+    _atomic_write(backup_path, incumbent_bytes)
+    try:
+        if not backup_path.exists() or backup_path.read_bytes() != incumbent_bytes:
+            raise HoldoutGateError("Incumbent backup could not be created or verified")
+        json.loads(backup_path.read_text(encoding="utf-8"))
+    except HoldoutGateError:
+        raise
+    except Exception as exc:
+        raise HoldoutGateError(f"Incumbent backup is unreadable or malformed: {exc}") from exc
+
+    tracking_runner = _CompleteCoverageRunner(runner)
+    metric_failures: List[str] = []
+
+    def checked_metric(expected: str, actual: str) -> float:
+        score = metric_fn(expected, actual)
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            metric_failures.append(f"non-numeric score: {score!r}")
+            raise HoldoutGateError(f"Holdout metric returned a non-numeric score: {score!r}")
+        numeric_score = float(score)
+        if not math.isfinite(numeric_score):
+            metric_failures.append(f"non-finite score: {score!r}")
+            raise HoldoutGateError(f"Holdout metric returned a non-finite score: {score!r}")
+        return numeric_score
+
+    promoted_bytes: Optional[bytes] = None
+    try:
+        # Local import avoids bootstrap <-> verification import initialization cycles.
+        from .verification import pre_flight_holdout_check
+
+        should_deploy, new_score, existing_score = pre_flight_holdout_check(
+            agent_name=agent_name,
+            new_optimized=candidate,
+            holdout_data=holdout_data,
+            metric_fn=checked_metric,
+            runner=tracking_runner,
+            storage=storage,
+            min_improvement=min_improvement,
+            verbose=verbose,
+        )
+        expected_calls = len(holdout_data) * 2
+        if tracking_runner.failures:
+            raise HoldoutGateError(
+                "Holdout evaluation failed; complete coverage is required: "
+                + "; ".join(tracking_runner.failures)
+            )
+        if metric_failures:
+            raise HoldoutGateError(
+                "Holdout metric failed; complete numeric coverage is required: "
+                + "; ".join(metric_failures)
+            )
+        if tracking_runner.calls != expected_calls or existing_score is None:
+            raise HoldoutGateError(
+                f"Holdout coverage incomplete: expected {expected_calls} calls, "
+                f"observed {tracking_runner.calls}"
+            )
+        if not should_deploy:
+            raise HoldoutGateError(
+                f"Candidate did not clear the holdout gate: new={new_score:.3f}, "
+                f"incumbent={existing_score:.3f}, required={min_improvement:+.3f}"
+            )
+
+        identity_payload = corpus_identity.as_dict()
+        candidate.metadata = {
+            **(candidate.metadata or {}),
+            "holdout_gate": {
+                "schema_version": 1,
+                "gate_type": "comparative",
+                "corpus_identity": identity_payload,
+                "candidate_evaluation": {
+                    "corpus_identity": identity_payload,
+                    "evaluated_examples": corpus_identity.cardinality,
+                    "score": float(new_score),
+                },
+                "incumbent_evaluation": {
+                    "corpus_identity": identity_payload,
+                    "evaluated_examples": corpus_identity.cardinality,
+                    "score": float(existing_score),
+                    "artifact_sha256": incumbent_artifact_sha256,
+                },
+                "min_improvement": float(min_improvement),
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        if "artifact_content_hash" in candidate.metadata:
+            candidate.metadata["artifact_content_hash"] = _prompt_semantic_hash(candidate)
+
+        promoted_path = promote_candidate_atomic(
+            agent_name,
+            candidate,
+            storage,
+            expected_latest_bytes=incumbent_bytes,
+        )
+        promoted_bytes = promoted_path.read_bytes()
+        if on_promoted is not None:
+            on_promoted(float(new_score), float(existing_score))
+        try:
+            backup_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Promoted %s but could not remove gate backup: %s", agent_name, exc)
+        return GatePromotionResult(
+            new_score=float(new_score),
+            existing_score=float(existing_score),
+            evaluated_examples=len(holdout_data),
+            latest_path=promoted_path,
+            corpus_sha256=corpus_identity.sha256,
+            corpus_cardinality=corpus_identity.cardinality,
+            incumbent_artifact_sha256=incumbent_artifact_sha256,
+        )
+    except Exception as exc:
+        if promoted_bytes is not None:
+            _rollback_promoted_latest(latest_path, promoted_bytes, incumbent_bytes)
+        if isinstance(exc, HoldoutGateError):
+            raise
+        raise HoldoutGateError(f"Holdout gate failed: {type(exc).__name__}: {exc}") from exc
 
 
 @dataclass
@@ -107,6 +617,7 @@ class BootstrapFewShot:
         threshold: float = 0.7,
         agent_name: str = "default",
         verbose: bool = True,
+        persist: bool = True,
     ) -> BootstrapResult:
         """
         Optimize a prompt using BootstrapFewShot.
@@ -118,6 +629,8 @@ class BootstrapFewShot:
             threshold: Minimum score to include as demo
             agent_name: Name for storage/tracking
             verbose: Whether to print progress
+            persist: Whether to persist the candidate. Set False when a caller
+                must validate it before promotion.
 
         Returns:
             BootstrapResult with optimized prompt and metrics
@@ -249,11 +762,12 @@ class BootstrapFewShot:
             metric_name=metric_fn.__name__ if hasattr(metric_fn, '__name__') else "custom",
             threshold=threshold,
             avg_score=avg_score,
+            metadata={"algorithm": "bootstrap"},
             format_instruction=self.format_instruction,  # Phase 6: Save for evaluation
         )
 
         # Save to storage
-        if demo_objects:
+        if persist and demo_objects:
             self.storage.save_demos(agent_name, demo_objects)
             self.storage.save_optimized_prompt(agent_name, optimized)
             if verbose:
@@ -516,6 +1030,7 @@ class BootstrapFewShot:
         threshold: float = 0.7,
         agent_name: str = "default",
         verbose: bool = True,
+        persist_candidate: bool = True,
     ) -> Tuple[BootstrapResult, float]:
         """
         Optimize with holdout set for validation.
@@ -528,11 +1043,30 @@ class BootstrapFewShot:
             threshold: Score threshold for demos
             agent_name: Name for storage
             verbose: Print progress
+            persist_candidate: Promote only after complete holdout coverage clears
+                the explicit ``threshold``. False returns a staged candidate.
 
         Returns:
             Tuple of (BootstrapResult, holdout_score)
         """
         import random
+
+        expected_latest_bytes: Optional[bytes] = None
+        expected_latest_absent = False
+        if persist_candidate:
+            validate_name(agent_name, kind="agent name")
+            latest_path = contained_path(
+                self.storage.prompts_dir, f"{agent_name}_latest.json"
+            )
+            if latest_path.exists():
+                try:
+                    expected_latest_bytes = latest_path.read_bytes()
+                except OSError as exc:
+                    raise HoldoutGateError(
+                        f"Incumbent is unreadable before holdout evaluation: {exc}"
+                    ) from exc
+            else:
+                expected_latest_absent = True
 
         # Split data
         shuffled = training_data.copy()
@@ -540,6 +1074,12 @@ class BootstrapFewShot:
         split_idx = int(len(shuffled) * (1 - holdout_ratio))
         train_set = shuffled[:split_idx]
         holdout_set = shuffled[split_idx:]
+
+        if not train_set:
+            raise HoldoutGateError("Training split is empty")
+        if not holdout_set:
+            raise HoldoutGateError("Holdout split is empty")
+        corpus_identity = holdout_corpus_identity(holdout_set)
 
         if verbose:
             print(f"Split: {len(train_set)} train, {len(holdout_set)} holdout")
@@ -552,6 +1092,7 @@ class BootstrapFewShot:
             threshold=threshold,
             agent_name=agent_name,
             verbose=verbose,
+            persist=False,
         )
 
         # Evaluate on holdout
@@ -563,16 +1104,66 @@ class BootstrapFewShot:
 
         for example in holdout_set:
             full_prompt = f"{optimized_prompt}\n\n## New Input\n\n{example.input_text}"
-            run_result = self.runner.run(full_prompt)
+            try:
+                run_result = self.runner.run(full_prompt)
+            except Exception as exc:
+                raise HoldoutGateError(
+                    f"Holdout evaluation raised {type(exc).__name__}: {exc}"
+                ) from exc
+            if run_result is None or not run_result.success:
+                error = getattr(run_result, "error", "missing runner result")
+                raise HoldoutGateError(
+                    f"Holdout evaluation failed; complete coverage is required: {error}"
+                )
+            score = metric_fn(example.expected_output, run_result.output)
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                raise HoldoutGateError(f"Holdout metric returned invalid score: {score!r}")
+            numeric_score = float(score)
+            if not math.isfinite(numeric_score):
+                raise HoldoutGateError(f"Holdout metric returned invalid score: {score!r}")
+            holdout_scores.append(numeric_score)
 
-            if run_result.success:
-                score = metric_fn(example.expected_output, run_result.output)
-                holdout_scores.append(score)
-
-        holdout_avg = sum(holdout_scores) / len(holdout_scores) if holdout_scores else 0.0
+        if len(holdout_scores) != len(holdout_set):
+            raise HoldoutGateError(
+                f"Holdout coverage incomplete: {len(holdout_scores)}/{len(holdout_set)}"
+            )
+        holdout_avg = sum(holdout_scores) / len(holdout_scores)
 
         if verbose:
             print(f"Holdout score: {holdout_avg:.2f} ({len(holdout_scores)} evaluated)")
+
+        if holdout_avg < threshold:
+            raise HoldoutGateError(
+                f"Candidate holdout score {holdout_avg:.3f} is below threshold {threshold:.3f}"
+            )
+        if persist_candidate:
+            identity_payload = corpus_identity.as_dict()
+            result.optimized_prompt.metadata = {
+                **(result.optimized_prompt.metadata or {}),
+                "holdout_gate": {
+                    "schema_version": 1,
+                    "gate_type": "absolute_threshold",
+                    "corpus_identity": identity_payload,
+                    "candidate_evaluation": {
+                        "corpus_identity": identity_payload,
+                        "evaluated_examples": corpus_identity.cardinality,
+                        "score": holdout_avg,
+                    },
+                    "threshold": float(threshold),
+                    "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+            if "artifact_content_hash" in result.optimized_prompt.metadata:
+                result.optimized_prompt.metadata["artifact_content_hash"] = (
+                    _prompt_semantic_hash(result.optimized_prompt)
+                )
+            promote_candidate_atomic(
+                agent_name,
+                result.optimized_prompt,
+                self.storage,
+                expected_latest_bytes=expected_latest_bytes,
+                expected_latest_absent=expected_latest_absent,
+            )
 
         return result, holdout_avg
 

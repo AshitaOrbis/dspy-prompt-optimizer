@@ -8,10 +8,13 @@ and parsing the output for use in optimization algorithms.
 import os
 import shutil
 import subprocess
-import json
 import re
-from dataclasses import dataclass
-from typing import Optional
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Iterator, Optional, Sequence
 
 
 # Default timeout in seconds (can be overridden via env var)
@@ -23,8 +26,36 @@ MIN_TIMEOUT = 5
 MAX_TIMEOUT = 1800
 
 # Hard cap on captured stdout/stderr per run. A runaway / adversarial model
-# response could otherwise buffer unbounded output in memory.
+# response could otherwise be retained or processed without a bound.
 MAX_OUTPUT_BYTES = int(os.environ.get("PROMPT_OPTIMIZER_MAX_OUTPUT_BYTES", 5_000_000))
+
+# Pipe reads stay small and unbuffered so the parent never accumulates a child
+# stream before applying MAX_OUTPUT_BYTES. Termination gets a short grace period
+# before the child is killed.
+_OUTPUT_READ_CHUNK_BYTES = 64 * 1024
+_PROCESS_POLL_SECONDS = 0.02
+_TERMINATE_GRACE_SECONDS = 0.25
+_KILL_GRACE_SECONDS = 1.0
+
+# The only ambient variables admitted when subprocess environment scrubbing is
+# enabled. Backend-specific callers all use this same policy.
+SUBPROCESS_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+    }
+)
+
+_TRUE_VALUES = frozenset({"1", "true", "yes"})
 
 # Patterns used to redact obvious secrets before any value is logged or stored.
 _SECRET_PATTERNS = [
@@ -45,15 +76,37 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
     return redacted
 
 
-def _build_subprocess_env() -> Optional[dict]:
-    """
-    Build the environment for the claude subprocess.
+def validate_timeout(timeout: object) -> int:
+    """Validate a subprocess timeout and clamp small positive values."""
+    if isinstance(timeout, bool):
+        raise ValueError("timeout must be a positive integer")
+    try:
+        parsed = int(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timeout must be a positive integer") from exc
+    if isinstance(timeout, float) and not timeout.is_integer():
+        raise ValueError("timeout must be a positive integer")
+    if parsed <= 0:
+        raise ValueError("timeout must be positive")
+    if parsed > MAX_TIMEOUT:
+        raise ValueError(f"timeout must be at most {MAX_TIMEOUT} seconds")
+    return max(MIN_TIMEOUT, parsed)
 
-    By default the subprocess inherits the parent environment (claude needs its
+
+def permission_automation_enabled() -> bool:
+    """Return whether unattended permission automation was explicitly enabled."""
+    return os.environ.get("PROMPT_OPTIMIZER_SKIP_PERMISSIONS", "").lower() in _TRUE_VALUES
+
+
+def _build_subprocess_env() -> dict:
+    """
+    Build the environment for a model subprocess.
+
+    By default the subprocess inherits the parent environment (model CLIs need
     auth/config, typically under $HOME). When PROMPT_OPTIMIZER_SCRUB_ENV is set,
     pass only an allowlisted, minimal environment so that ambient secrets
     (cloud tokens, CI variables, .env exports) are not exposed to a model that
-    may attempt tool-driven exfiltration. Returns None to mean "inherit".
+    may attempt tool-driven exfiltration.
     """
     if os.environ.get("PROMPT_OPTIMIZER_SCRUB_ENV", "").lower() not in ("1", "true", "yes"):
         # Inherit the parent environment, minus CLAUDECODE: its presence makes
@@ -62,11 +115,8 @@ def _build_subprocess_env() -> Optional[dict]:
         env.pop("CLAUDECODE", None)
         return env
 
-    # Minimal allowlist needed for claude to locate config/auth and run.
-    allowlist = {
-        "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "TMPDIR",
-        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
-    }
+    # Minimal allowlist needed for the CLIs to locate config/auth and run.
+    allowlist = set(SUBPROCESS_ENV_ALLOWLIST)
     # Allow explicit pass-through of named vars (e.g. a scoped token) if the
     # operator opts in, but never blanket-copy the environment.
     extra = os.environ.get("PROMPT_OPTIMIZER_ENV_PASSTHROUGH", "")
@@ -77,6 +127,40 @@ def _build_subprocess_env() -> Optional[dict]:
     # Guarantee a usable PATH even if the parent had none.
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     return env
+
+
+def _redact_error_content(
+    text: Optional[str],
+    *,
+    sensitive_values: Sequence[str],
+    child_env: dict,
+) -> Optional[str]:
+    """Remove prompt and ambient-environment values from backend errors."""
+    if not text:
+        return text
+
+    redacted = text
+    values = {value for value in sensitive_values if value}
+    values.update(value for value in child_env.values() if value)
+    for value in sorted(values, key=len, reverse=True):
+        redacted = redacted.replace(value, "<REDACTED>")
+    return redact_secrets(redacted)
+
+
+@contextmanager
+def private_prompt_file(text: str) -> Iterator[str]:
+    """Yield a mode-0600 temporary file containing sensitive prompt text."""
+    fd, path = tempfile.mkstemp(prefix="prompt-optimizer-", suffix=".txt")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as prompt_file:
+            prompt_file.write(text)
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 def _find_claude_binary() -> str:
@@ -142,6 +226,268 @@ class RunResult:
     raw_output: Optional[str] = None
 
 
+@dataclass
+class _StreamCapture:
+    """A single pipe's retained bytes and whether input crossed its cap."""
+
+    data: bytearray = field(default_factory=bytearray)
+    truncated: bool = False
+
+
+@dataclass
+class _ProcessCapture:
+    """Internal bounded result from a child process."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    timed_out: bool = False
+
+
+def _terminate_then_kill(process: subprocess.Popen) -> None:
+    """Stop a child promptly, escalating when it ignores termination."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A direct child should be reaped after SIGKILL. Surface the failure to
+        # the caller rather than waiting without a bound.
+        raise RuntimeError("model subprocess did not exit after kill")
+
+
+def _read_bounded_stream(
+    stream,
+    capture: _StreamCapture,
+    limit: int,
+    limit_reached: threading.Event,
+) -> None:
+    """Drain one unbuffered pipe while retaining at most ``limit`` bytes."""
+    while True:
+        remaining = limit - len(capture.data)
+        # The one-byte probe distinguishes an exact-limit EOF from truncation;
+        # it is never retained, so the capture itself remains bounded.
+        read_size = min(_OUTPUT_READ_CHUNK_BYTES, max(remaining + 1, 1))
+        chunk = stream.read(read_size)
+        if not chunk:
+            return
+        if remaining > 0:
+            capture.data.extend(chunk[:remaining])
+        if len(chunk) > remaining:
+            capture.truncated = True
+            limit_reached.set()
+            return
+
+
+def _write_stdin(stream, payload: bytes) -> None:
+    """Feed stdin without blocking concurrent stdout/stderr draining."""
+    try:
+        stream.write(payload)
+    except (BrokenPipeError, OSError):
+        # Matching subprocess.communicate(), an early child exit is reported by
+        # its return code rather than by a BrokenPipe from the writer.
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _capture_process(
+    cmd: Sequence[str],
+    *,
+    input: str,
+    timeout: int,
+    cwd: Optional[str],
+    env: dict,
+) -> _ProcessCapture:
+    """Run a child with concurrent, byte-bounded stdout/stderr capture."""
+    limit = max(int(MAX_OUTPUT_BYTES), 0)
+    process = subprocess.Popen(
+        list(cmd),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        bufsize=0,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    limit_reached = threading.Event()
+    stdout_capture = _StreamCapture()
+    stderr_capture = _StreamCapture()
+    stdout_thread = threading.Thread(
+        target=_read_bounded_stream,
+        args=(process.stdout, stdout_capture, limit, limit_reached),
+        name="prompt-optimizer-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_read_bounded_stream,
+        args=(process.stderr, stderr_capture, limit, limit_reached),
+        name="prompt-optimizer-stderr",
+        daemon=True,
+    )
+    stdin_thread = threading.Thread(
+        target=_write_stdin,
+        args=(process.stdin, input.encode("utf-8")),
+        name="prompt-optimizer-stdin",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    stdin_thread.start()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while process.poll() is None:
+        if limit_reached.is_set():
+            _terminate_then_kill(process)
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            _terminate_then_kill(process)
+            break
+        limit_reached.wait(min(_PROCESS_POLL_SECONDS, remaining))
+
+    # A child can exit between emitting the over-limit byte and the main thread
+    # observing the event. Readers still finish and preserve the cap decision.
+    stdout_thread.join(_KILL_GRACE_SECONDS)
+    stderr_thread.join(_KILL_GRACE_SECONDS)
+    stdin_thread.join(_KILL_GRACE_SECONDS)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        raise RuntimeError("model subprocess pipes did not close after exit")
+
+    return _ProcessCapture(
+        returncode=process.returncode if process.returncode is not None else -1,
+        stdout=bytes(stdout_capture.data),
+        stderr=bytes(stderr_capture.data),
+        stdout_truncated=stdout_capture.truncated,
+        stderr_truncated=stderr_capture.truncated,
+        timed_out=timed_out,
+    )
+
+
+def _decode_captured_output(value: bytes) -> str:
+    """Decode retained UTF-8 without expanding malformed input past its cap."""
+    return value.decode("utf-8", errors="ignore")
+
+
+def run_hardened_subprocess(
+    cmd: Sequence[str],
+    *,
+    stdin_text: str,
+    timeout: object,
+    cwd: Optional[str] = None,
+    sensitive_values: Sequence[str] = (),
+) -> RunResult:
+    """Execute one model CLI under the shared subprocess-safety policy."""
+    checked_timeout = validate_timeout(timeout)
+    child_env = _build_subprocess_env()
+
+    protected_values = tuple(value for value in sensitive_values if value)
+    if any(value == arg for value in protected_values for arg in cmd):
+        return RunResult(
+            output="",
+            success=False,
+            error="Refusing subprocess: sensitive prompt content found in argv",
+        )
+
+    try:
+        result = _capture_process(
+            list(cmd),
+            input=stdin_text,
+            timeout=checked_timeout,
+            cwd=cwd,
+            env=child_env,
+        )
+    except Exception as exc:
+        return RunResult(
+            output="",
+            success=False,
+            error=_redact_error_content(
+                str(exc),
+                sensitive_values=protected_values,
+                child_env=child_env,
+            ),
+        )
+
+    limit = max(int(MAX_OUTPUT_BYTES), 0)
+    stdout_truncated = result.stdout_truncated or len(result.stdout) > limit
+    stderr_truncated = result.stderr_truncated or len(result.stderr) > limit
+    stdout = _decode_captured_output(result.stdout[:limit])
+    stderr = _decode_captured_output(result.stderr[:limit])
+
+    if stdout_truncated or stderr_truncated:
+        truncated_streams = []
+        if stdout_truncated:
+            truncated_streams.append(f"stdout truncated at {limit} bytes")
+        if stderr_truncated:
+            truncated_streams.append(f"stderr truncated at {limit} bytes")
+        error = "Output limit exceeded; " + " and ".join(truncated_streams)
+        redacted_stderr = _redact_error_content(
+            stderr,
+            sensitive_values=protected_values,
+            child_env=child_env,
+        )
+        if redacted_stderr:
+            # Keep returned diagnostics bounded as well as the underlying pipe.
+            error += "\n" + redacted_stderr.encode("utf-8")[:limit].decode(
+                "utf-8", errors="ignore"
+            )
+        return RunResult(
+            output=stdout,
+            success=False,
+            error=error,
+            raw_output=stdout,
+        )
+
+    if result.timed_out:
+        return RunResult(
+            output=stdout,
+            success=False,
+            error=f"Timeout after {checked_timeout} seconds",
+            raw_output=stdout,
+        )
+
+    if result.returncode != 0:
+        return RunResult(
+            output="",
+            success=False,
+            error=_redact_error_content(
+                stderr,
+                sensitive_values=protected_values,
+                child_env=child_env,
+            )
+            or f"Exit code: {result.returncode}",
+            raw_output=stdout,
+        )
+
+    return RunResult(output=stdout, success=True, raw_output=stdout)
+
+
 class ClaudeRunner:
     """Wrapper for Claude Code CLI invocations."""
 
@@ -163,9 +509,7 @@ class ClaudeRunner:
         self.model = model
         if timeout is None:
             timeout = int(os.environ.get("PROMPT_OPTIMIZER_TIMEOUT", DEFAULT_TIMEOUT))
-        # Clamp to a sane range (defends against a hostile env pinning a huge or
-        # tiny timeout).
-        self.timeout = max(MIN_TIMEOUT, min(int(timeout), MAX_TIMEOUT))
+        self.timeout = validate_timeout(timeout)
         self.working_dir = working_dir
 
         # Resolve the claude executable once, at construction, to avoid a
@@ -174,26 +518,20 @@ class ClaudeRunner:
         # found (the subprocess call will then surface a clear error).
         self.claude_bin = _find_claude_binary()
 
-        # Whether to pass --dangerously-skip-permissions. This bypass is
-        # INHERENT to unattended/non-interactive optimization (the CLI would
-        # otherwise block on a permission prompt). It is documented in SECURITY.md.
-        # Operators who run only trusted datasets in a sandbox can disable it by
-        # setting PROMPT_OPTIMIZER_SKIP_PERMISSIONS=0, at the cost of the run
-        # hanging if the model attempts a gated tool call.
-        self.skip_permissions = os.environ.get(
-            "PROMPT_OPTIMIZER_SKIP_PERMISSIONS", "1"
-        ).lower() not in ("0", "false", "no")
-
-        self._env = _build_subprocess_env()
-
     def _base_cmd(self) -> list:
         """Build the leading argv shared by run() and run_with_system()."""
         cmd = [self.claude_bin, "--print", "--model", self.model]
-        if self.skip_permissions:
+        if permission_automation_enabled():
             cmd.append("--dangerously-skip-permissions")
         return cmd
 
-    def _exec(self, cmd: list, stdin_text: str) -> "RunResult":
+    def _exec(
+        self,
+        cmd: list,
+        stdin_text: str,
+        *,
+        sensitive_values: Sequence[str],
+    ) -> "RunResult":
         """
         Execute a claude argv with the prompt supplied on STDIN.
 
@@ -202,43 +540,16 @@ class ClaudeRunner:
         argument list, which is world-readable via /proc on many systems.
         Output is size-capped and secret-redacted before being returned.
         """
-        try:
-            result = subprocess.run(
-                cmd,
-                input=stdin_text,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                cwd=self.working_dir,
-                env=self._env,
-            )
-        except subprocess.TimeoutExpired:
-            return RunResult(output="", success=False, error=f"Timeout after {self.timeout} seconds")
-        except Exception as e:
-            return RunResult(output="", success=False, error=redact_secrets(str(e)))
-
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        if len(stdout) > MAX_OUTPUT_BYTES or len(stderr) > MAX_OUTPUT_BYTES:
-            return RunResult(
-                output="",
-                success=False,
-                error=f"Output exceeded {MAX_OUTPUT_BYTES} bytes; treating run as failed",
-            )
-
-        if result.returncode != 0:
-            return RunResult(
-                output="",
-                success=False,
-                error=redact_secrets(stderr) or f"Exit code: {result.returncode}",
-                raw_output=stdout,
-            )
-
-        return RunResult(
-            output=self._clean_output(stdout),
-            success=True,
-            raw_output=stdout,
+        result = run_hardened_subprocess(
+            cmd,
+            stdin_text=stdin_text,
+            timeout=self.timeout,
+            cwd=self.working_dir,
+            sensitive_values=sensitive_values,
         )
+        if result.success:
+            result.output = self._clean_output(result.output)
+        return result
 
     def run(self, prompt: str, context: Optional[str] = None) -> RunResult:
         """
@@ -253,7 +564,13 @@ class ClaudeRunner:
         """
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
         # Prompt delivered on STDIN (see _exec) rather than as an argv element.
-        return self._exec(self._base_cmd(), full_prompt)
+        return self._exec(
+            self._base_cmd(),
+            full_prompt,
+            sensitive_values=tuple(
+                value for value in (full_prompt, prompt, context) if value
+            ),
+        )
 
     def _clean_output(self, output: str) -> str:
         """Remove ANSI escape codes and clean up output."""
@@ -280,10 +597,17 @@ class ClaudeRunner:
             RunResult with output
         """
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
-        cmd = self._base_cmd()
-        cmd += ["--system-prompt", system_prompt]
-        # Prompt delivered on STDIN (see _exec) rather than as an argv element.
-        return self._exec(cmd, full_prompt)
+        sensitive_values = tuple(
+            value for value in (full_prompt, prompt, context, system_prompt) if value
+        )
+        with private_prompt_file(system_prompt) as system_prompt_path:
+            cmd = self._base_cmd()
+            cmd += ["--system-prompt-file", system_prompt_path]
+            return self._exec(
+                cmd,
+                full_prompt,
+                sensitive_values=sensitive_values,
+            )
 
     def with_model(self, model: str) -> 'ClaudeRunner':
         """

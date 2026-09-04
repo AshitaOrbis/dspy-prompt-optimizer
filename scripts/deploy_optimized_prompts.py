@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -26,6 +27,10 @@ from typing import Optional
 # Make the optimizer library importable for the shared validation helpers.
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 from prompt_optimizer.validation import validate_name, contained_path, ValidationError
+
+
+GENERATED_BEGIN = "<!-- prompt-optimizer:generated:start -->"
+GENERATED_END = "<!-- prompt-optimizer:generated:end -->"
 
 
 def _safe_fence(*bodies: str) -> str:
@@ -57,12 +62,25 @@ def load_optimized_prompt(agent_name: str) -> dict:
         return json.load(f)
 
 
+def _valid_demos(demos: list) -> list[dict]:
+    """Return only demos whose required prompt fields are strings."""
+    return [
+        demo
+        for demo in demos
+        if isinstance(demo, dict)
+        and isinstance(demo.get("input_text"), str)
+        and isinstance(demo.get("output_text"), str)
+    ]
+
+
 def format_demo_section(demos: list) -> str:
     """Format demos as a markdown section."""
+    demos = _valid_demos(demos)
     if not demos:
         return ""
 
     lines = [
+        GENERATED_BEGIN,
         "",
         "## Few-Shot Examples",
         "",
@@ -71,14 +89,8 @@ def format_demo_section(demos: list) -> str:
     ]
 
     for i, demo in enumerate(demos, 1):
-        # Schema guard: demo content is untrusted (it originates from model
-        # output). Coerce/validate types so malformed JSON can't crash deploy or
-        # smuggle non-string payloads into the agent file.
-        raw_in = demo.get("input_text")
-        raw_out = demo.get("output_text")
-        if not isinstance(raw_in, str) or not isinstance(raw_out, str):
-            # Skip malformed demos rather than crashing the whole deploy.
-            continue
+        raw_in = demo["input_text"]
+        raw_out = demo["output_text"]
         input_text = raw_in[:500] + ("..." if len(raw_in) > 500 else "")
         output_text = raw_out[:1000] + ("..." if len(raw_out) > 1000 else "")
 
@@ -102,7 +114,69 @@ def format_demo_section(demos: list) -> str:
             lines.append(f"*Score: {float(score):.3f}*")
         lines.append("")
 
+    lines.append(GENERATED_END)
     return "\n".join(lines)
+
+
+def _outside_fence_lines(content: str) -> list[tuple[int, int, str]]:
+    """Return line offsets/text for Markdown lines outside fenced blocks."""
+    outside = []
+    fence_char = None
+    fence_length = 0
+    offset = 0
+
+    for line in content.splitlines(keepends=True):
+        text = line.rstrip("\r\n")
+        fence_match = re.match(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$", text)
+        if fence_match:
+            run = fence_match.group(1)
+            suffix = fence_match.group(2)
+            if fence_char is None:
+                fence_char = run[0]
+                fence_length = len(run)
+            elif run[0] == fence_char and len(run) >= fence_length and not suffix.strip():
+                fence_char = None
+                fence_length = 0
+        elif fence_char is None:
+            outside.append((offset, offset + len(line), text))
+        offset += len(line)
+
+    return outside
+
+
+def _remove_existing_demo_section(content: str) -> str:
+    """Remove one generated block, migrating an unmarked legacy block safely."""
+    outside = _outside_fence_lines(content)
+    begins = [(start, end) for start, end, text in outside if text == GENERATED_BEGIN]
+    ends = [(start, end) for start, end, text in outside if text == GENERATED_END]
+
+    if begins or ends:
+        if len(begins) != 1 or len(ends) != 1 or begins[0][0] >= ends[0][0]:
+            raise ValueError("Malformed generated demo markers; refusing deployment")
+        start = begins[0][0]
+        end = ends[0][1]
+    else:
+        legacy_headings = [
+            (start, end)
+            for start, end, text in outside
+            if text == "## Few-Shot Examples"
+        ]
+        if not legacy_headings:
+            return content
+        if len(legacy_headings) != 1:
+            raise ValueError("Multiple legacy demo sections; refusing deployment")
+        start = legacy_headings[0][0]
+        end = len(content)
+        for next_start, _, text in outside:
+            if next_start > start and text.startswith("## "):
+                end = next_start
+                break
+
+    before = content[:start].rstrip()
+    after = content[end:].lstrip()
+    if before and after:
+        return f"{before}\n\n{after}"
+    return before or after
 
 
 def inject_demos_to_agent(
@@ -140,35 +214,49 @@ def inject_demos_to_agent(
     # already-mutated content, making restore impossible).
     with open(agent_path, encoding="utf-8") as f:
         original_content = f.read()
-    content = original_content
-
-    # Check if demos already exist
-    if "## Few-Shot Examples" in content:
-        # Remove existing section
-        start = content.find("## Few-Shot Examples")
-        # Find next ## or end of file
-        rest = content[start + len("## Few-Shot Examples"):]
-        next_section = rest.find("\n## ")
-        if next_section == -1:
-            content = content[:start].rstrip()
-        else:
-            content = content[:start].rstrip() + rest[next_section:]
+    content = _remove_existing_demo_section(original_content)
 
     # Add demo section before the final guidelines (or at end)
-    demo_section = format_demo_section(demos)
+    valid_demos = _valid_demos(demos)
+    if not valid_demos:
+        if verbose:
+            print(f"Error: no valid demos to insert for {agent_name}")
+        return False
+    demo_section = format_demo_section(valid_demos)
 
-    # Find a good insertion point (before Guidelines if it exists)
-    if "## Guidelines" in content:
-        idx = content.find("## Guidelines")
-        new_content = content[:idx].rstrip() + "\n" + demo_section + "\n" + content[idx:]
+    # Find a good insertion point before an actual Guidelines section, not a
+    # same-named heading embedded in a fenced fixture or example.
+    guideline_offsets = [
+        start
+        for start, _, text in _outside_fence_lines(content)
+        if text == "## Guidelines"
+    ]
+    if guideline_offsets:
+        idx = guideline_offsets[0]
+        new_content = (
+            content[:idx].rstrip()
+            + "\n\n"
+            + demo_section
+            + "\n\n"
+            + content[idx:].lstrip()
+        )
     else:
-        new_content = content.rstrip() + "\n" + demo_section
+        new_content = content.rstrip() + "\n\n" + demo_section + "\n"
 
     if dry_run:
         if verbose:
             print(f"Would update: {agent_path}")
-            print(f"  - Adding {len(demos)} few-shot examples")
+            print(f"  - Adding {len(valid_demos)} few-shot examples")
             print(f"  - New length: {len(new_content)} chars")
+            # This is the exact content used by the live path. Do not apply a
+            # dry-run-only redaction transform that would hide deployed text.
+            diff = difflib.unified_diff(
+                original_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=str(agent_path),
+                tofile=f"{agent_path} (proposed)",
+            )
+            print("".join(diff), end="")
         return True
 
     # Backup the ORIGINAL content (not the mutated `content`) before writing.
@@ -197,7 +285,7 @@ def inject_demos_to_agent(
 
     if verbose:
         print(f"Updated: {agent_path}")
-        print(f"  - Added {len(demos)} few-shot examples")
+        print(f"  - Added {len(valid_demos)} few-shot examples")
         print(f"  - Backup: {backup_path}")
 
     return True

@@ -5,11 +5,14 @@ Provides parallel and sequential optimization capabilities for
 efficiently running BootstrapFewShot across multiple targets.
 """
 
+import hashlib
+import json
 import logging
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -30,9 +33,32 @@ class BatchTarget:
     metric_fn: Callable[[str, str], float]
     threshold: float = 0.7
     max_demos: int = 3
+    min_demos: int = 1
+    allow_zero_demos: bool = False
     # Phase 6: Transformer support
     demo_transformer: Optional[Callable] = None
     format_instruction: str = ""
+
+    def __post_init__(self) -> None:
+        if self.max_demos < 0:
+            raise ValueError("max_demos must be non-negative")
+        if self.min_demos < 0:
+            raise ValueError("min_demos must be non-negative")
+        if not self.allow_zero_demos and self.min_demos == 0:
+            raise ValueError("min_demos=0 requires allow_zero_demos=True")
+        if not self.allow_zero_demos and self.min_demos > self.max_demos:
+            raise ValueError("min_demos cannot exceed max_demos")
+
+
+@dataclass(frozen=True)
+class ArtifactIdentity:
+    """Identity of the exact candidate written by this batch run."""
+
+    run_id: str
+    created_at: str
+    content_hash: str
+    file_hash: str
+    path: Path
 
 
 @dataclass
@@ -42,6 +68,12 @@ class BatchResult:
     result: Optional[BootstrapResult]
     error: Optional[str]
     duration_seconds: float
+    artifact: Optional[ArtifactIdentity] = None
+
+    @property
+    def succeeded(self) -> bool:
+        """A batch target succeeds only with its verified, run-bound artifact."""
+        return self.error is None and self.result is not None and self.artifact is not None
 
 
 @dataclass
@@ -88,6 +120,86 @@ def load_training_data(path: Path) -> List[TrainingExample]:
     return examples
 
 
+_ARTIFACT_METADATA_KEYS = {
+    "artifact_run_id",
+    "artifact_created_at",
+    "artifact_content_hash",
+}
+
+
+def _candidate_content_hash(candidate) -> str:
+    """Hash candidate semantics without the self-referential identity fields."""
+    payload = asdict(candidate)
+    metadata = dict(payload.get("metadata") or {})
+    for key in _ARTIFACT_METADATA_KEYS:
+        metadata.pop(key, None)
+    payload["metadata"] = metadata or None
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _persist_and_verify_artifact(
+    target: BatchTarget,
+    result: BootstrapResult,
+    storage: DemoStorage,
+    run_id: str,
+    created_at: str,
+) -> ArtifactIdentity:
+    """Write and reload the exact candidate, rejecting stale or absent artifacts."""
+    candidate = result.optimized_prompt
+    content_hash = _candidate_content_hash(candidate)
+    metadata = dict(candidate.metadata or {})
+    metadata.update(
+        {
+            "artifact_run_id": run_id,
+            "artifact_created_at": created_at,
+            "artifact_content_hash": content_hash,
+        }
+    )
+    candidate.metadata = metadata
+
+    storage.save_demos(target.name, candidate.demos)
+    paths = storage.save_optimized_prompt(target.name, candidate)
+    latest_path = paths.get("latest") if isinstance(paths, dict) else None
+    if latest_path is None:
+        raise RuntimeError("storage did not return a latest artifact path")
+    latest_path = Path(latest_path)
+    if not latest_path.is_file():
+        raise RuntimeError(f"new artifact was not written: {latest_path}")
+
+    persisted = storage.load_optimized_prompt(target.name)
+    if persisted is None:
+        raise RuntimeError("new artifact could not be reloaded")
+    persisted_metadata = persisted.metadata or {}
+    expected_metadata = {
+        "artifact_run_id": run_id,
+        "artifact_created_at": created_at,
+        "artifact_content_hash": content_hash,
+    }
+    for key, expected in expected_metadata.items():
+        if persisted_metadata.get(key) != expected:
+            raise RuntimeError(
+                f"artifact identity mismatch for {key}; stale artifact refused"
+            )
+    if _candidate_content_hash(persisted) != content_hash:
+        raise RuntimeError("artifact content hash mismatch")
+
+    file_hash = hashlib.sha256(latest_path.read_bytes()).hexdigest()
+    return ArtifactIdentity(
+        run_id=run_id,
+        created_at=created_at,
+        content_hash=content_hash,
+        file_hash=file_hash,
+        path=latest_path,
+    )
+
+
 def optimize_single_target(
     target: BatchTarget,
     runner: ClaudeRunner,
@@ -109,6 +221,8 @@ def optimize_single_target(
     import time
 
     start_time = time.time()
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
 
     try:
         # Load prompt and training data
@@ -139,6 +253,29 @@ def optimize_single_target(
             threshold=target.threshold,
             agent_name=target.name,
             verbose=verbose,
+            persist=False,
+        )
+
+        successful_evaluations = result.total_examples - result.failed_examples
+        if successful_evaluations <= 0:
+            raise RuntimeError(
+                "optimization produced no successful model evaluations"
+            )
+
+        demo_count = len(result.optimized_prompt.demos)
+        required_demos = 0 if target.allow_zero_demos else target.min_demos
+        if demo_count < required_demos:
+            raise RuntimeError(
+                f"optimization selected {demo_count} demos; "
+                f"at least {required_demos} required"
+            )
+
+        artifact = _persist_and_verify_artifact(
+            target=target,
+            result=result,
+            storage=storage,
+            run_id=run_id,
+            created_at=created_at,
         )
 
         duration = time.time() - start_time
@@ -151,6 +288,7 @@ def optimize_single_target(
             result=result,
             error=None,
             duration_seconds=duration,
+            artifact=artifact,
         )
 
     except Exception as e:
@@ -167,6 +305,7 @@ def optimize_single_target(
             result=None,
             error=error_msg,
             duration_seconds=duration,
+            artifact=None,
         )
 
 
@@ -216,8 +355,8 @@ def optimize_batch_sequential(
     end_time = datetime.now()
     total_duration = time.time() - start_ts
 
-    successful = sum(1 for r in results if r.error is None)
-    failed = sum(1 for r in results if r.error is not None)
+    successful = sum(1 for r in results if r.succeeded)
+    failed = len(results) - successful
 
     summary = BatchSummary(
         total_targets=len(targets),
@@ -307,8 +446,8 @@ def optimize_batch_parallel(
     end_time = datetime.now()
     total_duration = time.time() - start_ts
 
-    successful = sum(1 for r in results if r.error is None)
-    failed = sum(1 for r in results if r.error is not None)
+    successful = sum(1 for r in results if r.succeeded)
+    failed = len(results) - successful
 
     summary = BatchSummary(
         total_targets=len(targets),
@@ -366,7 +505,7 @@ def generate_batch_report(
     ]
 
     # Successful targets
-    successful_results = [r for r in summary.results if r.error is None]
+    successful_results = [r for r in summary.results if r.succeeded]
     if successful_results:
         lines.extend([
             "### Successful",
@@ -384,7 +523,7 @@ def generate_batch_report(
         lines.append("")
 
     # Failed targets
-    failed_results = [r for r in summary.results if r.error is not None]
+    failed_results = [r for r in summary.results if not r.succeeded]
     if failed_results:
         lines.extend([
             "### Failed",
@@ -394,7 +533,8 @@ def generate_batch_report(
         ])
 
         for r in failed_results:
-            error_short = r.error[:50] + "..." if len(r.error) > 50 else r.error
+            error = r.error or "missing verified artifact"
+            error_short = error[:50] + "..." if len(error) > 50 else error
             lines.append(f"| {r.target.name} | {error_short} |")
         lines.append("")
 
